@@ -1,0 +1,23 @@
+# Public synthetic demo: every visitor can select the administrator persona.
+# Free storage is ephemeral; no disk or actual deployment is implied.
+services:
+  - type: web
+    name: orgmind-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOW_DEMO_PERSONA
+        value: "true"
+      - key: DATA_DIR
+        value: /app/data
+      - key: GENERATION_PROVIDER
+        value: local
+      - key: EMBEDDING_PROVIDER
+        value: local

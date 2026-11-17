@@ -1,0 +1,17 @@
+# Only application source, bundled licensed assets, frontend, and dependencies enter the build.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!app/
+!app/**
+!static/
+!static/**
+
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.sqlite*
+**/*.db*
+**/audit.key
