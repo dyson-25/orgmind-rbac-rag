@@ -2,84 +2,33 @@
 
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { token: null, user: null, config: null, generation: 0, tasks: new Map(), tab: 'assistant' };
-  const tabNames = { assistant: 'Knowledge Assistant', compare: 'Live Role Comparator', sql: 'SQL Studio', documents: 'Document ACL & Audit', benchmark: 'Live Benchmark' };
+  const state = { token: null, user: null, config: null, generation: 0, tasks: new Map(), tab: 'assistant', selected: new Set(), conversation: null, documents: [], urls: new Set(), preview: null, roles: [], departments: [] };
+  const tabNames = { overview: 'Overview', assistant: 'Knowledge Workspace', documents: 'Documents', users: 'Users & roles', departments: 'Departments', sql: 'Organization analytics', provider: 'AI status', audit: 'Audit trail', compare: 'Diagnostics · Role comparator', benchmark: 'Diagnostics · Benchmark', profile: 'My account' };
   let elementId = 0;
   const number = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
   const percent = new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 2 });
-
-  function node(tag, text, className) {
+  const node = (tag, text, className) => {
     const result = document.createElement(tag);
     if (text !== undefined && text !== null) result.textContent = String(text);
     if (className) result.className = className;
     return result;
-  }
-
+  };
+  const empty = (id, text) => $(id).replaceChildren(node('p', text, 'empty-state'));
   function status(message, error = false) {
     $('global-status').textContent = message;
     $('global-status').classList.toggle('error', error);
+    if ($('login-dialog').open) $('login-status').textContent = message;
   }
-
-  function empty(target, message) {
-    $(target).replaceChildren(node('p', message, 'empty-state'));
-  }
-
   function abortTask(key) {
     const task = state.tasks.get(key);
-    if (task) {
-      task.controller.abort();
-      if (task.button) task.button.disabled = !state.user && task.button.hasAttribute('data-auth');
-      if (task.target) task.target.removeAttribute('aria-busy');
-      state.tasks.delete(key);
-    }
+    if (!task) return;
+    task.controller.abort();
+    if (task.button) task.button.disabled = !state.user && task.button.hasAttribute('data-auth');
+    if (task.target) task.target.removeAttribute('aria-busy');
+    state.tasks.delete(key);
   }
-
-  function clearEvidence() {
-    for (const key of ['chat', 'compare', 'sql', 'benchmark', 'citation', 'documents', 'audit']) abortTask(key);
-    $('chat-messages').replaceChildren();
-    $('chat-empty').hidden = false;
-    empty('compare-results', 'Run a question to compare real authorized responses.');
-    empty('sql-results', 'Select a metric and run it to see live data.');
-    empty('document-list', 'Refresh the library to load documents.');
-    empty('audit-results', 'Load the audit trail to inspect server-recorded events and integrity.');
-    empty('benchmark-results', 'No benchmark has been run in this session. All metrics will come from the live evaluator.');
-    closeEvidence();
-  }
-
-  function resetSession(message) {
-    state.generation += 1;
-    // Public configuration is independent of the active authenticated session.
-    for (const key of [...state.tasks.keys()]) if (key !== 'config') abortTask(key);
-    state.token = null;
-    state.user = null;
-    clearEvidence();
-    for (const id of ['login-form', 'chat-form', 'compare-form', 'sql-form', 'upload-form']) $(id).reset();
-    $('credentials').open = false;
-    updateSession();
-    selectTab('assistant');
-    status(message);
-  }
-
-  function updateSession() {
-    const user = state.user;
-    document.body.classList.toggle('signed-in', Boolean(user));
-    document.querySelectorAll('[data-admin]').forEach((item) => { item.hidden = user?.role !== 'admin'; });
-    document.querySelectorAll('[data-auth]').forEach((button) => { button.disabled = !user; });
-    $('logout').hidden = !user;
-    $('session-label').textContent = user ? `${user.role} workspace` : 'Signed out';
-    $('session-scopes').textContent = user ? user.id : 'Choose a demo persona to explore.';
-    $('context-identity').textContent = user?.id ?? 'Not signed in';
-    $('context-role').textContent = user?.role ?? '—';
-    $('context-epoch').textContent = user?.acl_epoch ?? '—';
-    $('context-scopes').replaceChildren(...(user?.scopes ?? ['Sign in to view']).map((scope) => node('span', scope, 'badge quiet')));
-    $('demo-login').disabled = !state.config?.demo_enabled;
-  }
-
   async function work(key, button, target, pending, execute, onError) {
-    if (key === 'mutation' && state.tasks.has(key)) {
-      status('A document change is in progress. Please wait.');
-      return;
-    }
+    if (key === 'mutation' && state.tasks.has(key)) { status('A change is in progress. Please wait.'); return; }
     abortTask(key);
     const generation = state.generation;
     const token = state.token;
@@ -89,45 +38,42 @@
     if (button) button.disabled = true;
     if (target) target.setAttribute('aria-busy', 'true');
     status(pending);
-    const request = async (path, { method = 'GET', body, publicRequest = false } = {}) => {
-      const headers = { Accept: 'application/json' };
+    const request = async (path, { method = 'GET', body, publicRequest = false, blob = false } = {}) => {
+      const headers = { Accept: blob ? 'application/pdf, image/png' : 'application/json' };
       if (!publicRequest) {
         if (!token) throw new Error('Sign in to continue.');
         headers.Authorization = `Bearer ${token}`;
       }
       const isForm = body instanceof FormData;
       if (body !== undefined && !isForm) headers['Content-Type'] = 'application/json';
-      const response = await fetch(path, {
-        method, headers, body: body === undefined ? undefined : (isForm ? body : JSON.stringify(body)),
-        signal: task.controller.signal, cache: 'no-store', credentials: 'omit', redirect: 'error'
-      });
+      const response = await fetch(path, { method, headers, body: body === undefined ? undefined : (isForm ? body : JSON.stringify(body)), signal: task.controller.signal, cache: 'no-store', credentials: 'omit', redirect: 'error' });
       if (!current()) throw new DOMException('Superseded request', 'AbortError');
+      if (response.status === 401 && !publicRequest) {
+        resetSession('Session expired or identity changed. Sign in again.');
+        throw new DOMException('Session ended', 'AbortError');
+      }
       let data = null;
       if (response.status !== 204) {
-        const text = await response.text();
-        if (!current()) throw new DOMException('Superseded request', 'AbortError');
-        try { data = JSON.parse(text); } catch { /* Do not display HTML or server error bodies. */ }
-      }
-      if (!response.ok) {
-        if (response.status === 401 && !publicRequest) {
-          resetSession('Session expired or identity changed. Sign in again.');
-          throw new DOMException('Session ended', 'AbortError');
+        if (blob && response.ok) {
+          const type = response.headers.get('Content-Type')?.split(';')[0];
+          if (!['image/png', 'application/pdf'].includes(type)) throw new Error('The server returned an unexpected file type.');
+          data = await response.blob();
+        } else {
+          try { data = await response.json(); } catch { /* Never display raw server HTML. */ }
         }
+      }
+      if (!current()) throw new DOMException('Superseded request', 'AbortError');
+      if (!response.ok) {
         const detail = typeof data?.detail === 'string' && response.status < 500 ? data.detail : null;
-        throw new Error(detail || (response.status >= 500
-          ? (key === 'benchmark'
-            ? 'Benchmark failed. It requires the seeded Acme corpus and original persona permissions. Check the server and restore any modified prerequisites before retrying.'
-            : 'The server could not complete this operation. Please retry or check the server logs.')
-          : `Request failed (${response.status}). Check your inputs and access permissions.`));
+        throw new Error(detail || (response.status >= 500 ? 'The server could not complete this operation. Please retry.' : `Request failed (${response.status}). Check your inputs and access permissions.`));
       }
       if (response.status !== 204 && data === null) throw new Error('The server returned an invalid response.');
       return data;
     };
-    try {
-      await execute(request);
-    } catch (error) {
+    try { await execute(request); }
+    catch (error) {
       if (current() && error.name !== 'AbortError') {
-        const message = error instanceof TypeError ? 'Unable to reach the API. Check the server connection and retry.' : error.message;
+        const message = error instanceof TypeError ? 'Unable to reach the API. Check the connection and retry.' : error.message;
         status(message, true);
         if (onError) onError(message);
       }
@@ -139,76 +85,95 @@
       }
     }
   }
-
   function authenticated(admin = false) {
-    if (!state.user || (admin && state.user.role !== 'admin')) {
-      status(admin ? 'Sign in with a backend administrator identity to use this tool.' : 'Choose a demo persona and enter the workspace first.', true);
-      return false;
-    }
+    if (!state.user || (admin && state.user.role !== 'admin')) { status(admin ? 'Administrator access is required.' : 'Sign in to continue.', true); return false; }
     return true;
   }
-
+  function clearChat() {
+    abortTask('chat'); abortTask('conversation');
+    state.conversation = null;
+    $('chat-messages').replaceChildren();
+    $('chat-empty').hidden = false;
+    $('chat-form').reset();
+    closeEvidence();
+  }
+  function resetSession(message) {
+    state.generation += 1;
+    for (const key of [...state.tasks.keys()]) if (key !== 'config') abortTask(key);
+    state.token = null; state.user = null; state.documents = []; state.selected.clear(); state.roles = []; state.departments = [];
+    clearChat();
+    for (const id of ['document-list','conversation-list','overview-results','users-results','roles-results','departments-results','provider-results','audit-results','profile-results','compare-results','sql-results','benchmark-results','user-editor','department-editor']) $(id).replaceChildren();
+    for (const form of document.querySelectorAll('form')) form.reset();
+    $('login-dialog').close();
+    updateSession(); updateSelection();
+    status(message);
+  }
+  function updateSession() {
+    const user = state.user;
+    document.body.classList.toggle('signed-in', Boolean(user));
+    $('app-shell').hidden = !user; $('landing').hidden = Boolean(user);
+    document.querySelectorAll('[data-admin]').forEach((item) => { item.hidden = user?.role !== 'admin'; });
+    document.querySelectorAll('[data-auth]').forEach((item) => { item.disabled = !user; });
+    $('session-label').textContent = user?.name || user?.id || 'Signed out';
+    $('session-scopes').textContent = user ? `${user.role} · ${user.department?.name || 'No department'}` : '';
+    $('nav-heading').textContent = user?.role === 'admin' ? 'ADMINISTRATION' : 'KNOWLEDGE WORKSPACE';
+    $('workspace-kind').textContent = user?.role === 'admin' ? 'Admin dashboard' : 'Employee workspace';
+    $('context-identity').textContent = user?.name || user?.id || 'Not signed in';
+    $('context-role').textContent = user?.role || '—';
+    $('context-epoch').textContent = user?.acl_epoch ?? '—';
+    $('context-scopes').replaceChildren(...(user?.scopes || []).map((scope) => node('span', scope, 'badge quiet')));
+  }
   function selectTab(name, focus = false) {
     const tab = $(`tab-${name}`);
-    if (!tab || tab.hidden) return;
+    if (!state.user || !tab || tab.hidden) return;
     state.tab = name;
     document.querySelectorAll('[role="tab"]').forEach((item) => {
       const active = item === tab;
-      item.setAttribute('aria-selected', String(active));
-      item.tabIndex = active ? 0 : -1;
+      item.setAttribute('aria-selected', String(active)); item.tabIndex = active ? 0 : -1;
       $(item.getAttribute('aria-controls')).hidden = !active;
     });
     $('breadcrumb').textContent = tabNames[name];
     if (focus) tab.focus();
+    const loaders = { overview: loadOverview, documents: loadDocuments, users: loadUsers, departments: loadDepartments, provider: loadProvider, audit: loadAudit, assistant: loadConversations, profile: renderProfile };
+    if (loaders[name]) loaders[name]();
   }
-
   document.querySelectorAll('[role="tab"]').forEach((tab) => {
     tab.addEventListener('click', () => selectTab(tab.dataset.tab));
     tab.addEventListener('keydown', (event) => {
       const visible = [...document.querySelectorAll('[role="tab"]')].filter((item) => !item.hidden);
       let index = visible.indexOf(tab);
-      if (['ArrowRight', 'ArrowDown'].includes(event.key)) index = (index + 1) % visible.length;
-      else if (['ArrowLeft', 'ArrowUp'].includes(event.key)) index = (index - 1 + visible.length) % visible.length;
+      if (['ArrowRight','ArrowDown'].includes(event.key)) index = (index + 1) % visible.length;
+      else if (['ArrowLeft','ArrowUp'].includes(event.key)) index = (index - 1 + visible.length) % visible.length;
       else if (event.key === 'Home') index = 0;
       else if (event.key === 'End') index = visible.length - 1;
       else return;
-      event.preventDefault();
-      selectTab(visible[index].dataset.tab, true);
+      event.preventDefault(); selectTab(visible[index].dataset.tab, true);
     });
   });
-
-  function signedIn(data) {
-    if (!data.access_token || !data.user?.id || !Array.isArray(data.user.scopes)) throw new Error('Invalid authentication response.');
-    state.token = data.access_token;
-    state.user = data.user;
-    $('password').value = '';
-    $('credentials').open = false;
-    updateSession();
-    status(`Signed in as ${data.user.id}. Permissions are enforced by the backend.`);
+  function openLogin(demo) {
+    $('demo-explanation').hidden = !demo;
+    $('login-status').textContent = '';
+    $('login-dialog').showModal(); $('username').focus();
   }
-
-  $('persona').addEventListener('change', () => resetSession('Persona changed. Previous session content cleared; select Enter demo workspace to sign in.'));
-  $('logout').addEventListener('click', () => {
-    resetSession('Signed out. The token and workspace results have been cleared.');
-    if (Object.hasOwn(state.config?.personas ?? {}, 'general_user')) $('persona').value = 'general_user';
-  });
-  $('demo-form').addEventListener('submit', (event) => {
-    event.preventDefault();
-    if (!state.config?.demo_enabled) return;
-    const persona = $('persona').value;
-    resetSession('Starting a new demo session…');
-    work('auth', $('demo-login'), null, 'Signing in to the demo workspace…', async (request) => {
-      signedIn(await request('/api/auth/demo-persona', { method: 'POST', body: { persona_id: persona }, publicRequest: true }));
-    });
-  });
+  $('landing-signin').addEventListener('click', () => openLogin(false));
+  $('hero-signin').addEventListener('click', () => openLogin(false));
+  $('explore-demo').addEventListener('click', () => openLogin(true));
+  function closeLogin() { abortTask('auth'); $('password').value = ''; $('login-dialog').close(); }
+  $('close-login').addEventListener('click', closeLogin);
+  $('login-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeLogin(); });
+  $('logout').addEventListener('click', () => { resetSession('Signed out. Your session and workspace content have been cleared.'); $('landing-signin').focus(); });
   $('login-form').addEventListener('submit', (event) => {
     event.preventDefault();
-    const credentials = { username: $('username').value, password: $('password').value };
-    const button = event.submitter || $('login-form').querySelector('button');
-    resetSession('Starting a new session…');
-    work('auth', button, null, 'Signing in…', async (request) => {
-      try { signedIn(await request('/api/auth/login', { method: 'POST', body: credentials, publicRequest: true })); }
-      finally { credentials.password = ''; }
+    const credentials = { username: $('username').value.trim(), password: $('password').value };
+    work('auth', $('login-submit'), $('login-form'), 'Signing in…', async (request) => {
+      try {
+        const data = await request('/api/auth/login', { method: 'POST', body: credentials, publicRequest: true });
+        if (!data.access_token || !data.user?.id || !Array.isArray(data.user.scopes)) throw new Error('Invalid authentication response.');
+        state.token = data.access_token; state.user = data.user;
+        $('password').value = ''; $('login-dialog').close(); updateSession();
+        selectTab(data.user.role === 'admin' ? 'overview' : 'assistant');
+        $('main').focus(); status(`Welcome, ${data.user.name || data.user.id}.`);
+      } finally { credentials.password = ''; $('password').value = ''; }
     });
   });
   $('theme-toggle').addEventListener('click', () => {
@@ -216,102 +181,178 @@
     $('theme-toggle').setAttribute('aria-pressed', String(dark));
     $('theme-toggle').setAttribute('aria-label', dark ? 'Use light theme' : 'Use dark theme');
   });
-
-  function answerContent(result) {
+  function safeMarkdown(text) {
     const fragment = document.createDocumentFragment();
-    const badges = node('div', null, 'badge-row');
-    badges.append(node('span', `Mode: ${result.generation_mode}`, 'badge violet'), node('span', `ACL epoch: ${result.acl_epoch}`, 'badge quiet'));
-    fragment.append(badges);
-    if (result.injection_warning) fragment.append(node('p', 'Injection warning: suspicious source instructions were detected. Review the evidence carefully.', 'notice'));
-    fragment.append(node('p', result.answer, 'answer-text'));
-    if (!result.citations?.length) fragment.append(node('p', 'No cited evidence was returned. This may be an insufficient-evidence or access-limited response.', 'notice'));
-    else {
-      const citations = node('div', null, 'citations');
-      for (const citation of result.citations) {
-        const button = node('button', `${citation.title} · p. ${citation.page} ↗`, 'citation');
-        button.type = 'button';
-        button.setAttribute('aria-label', `Inspect ${citation.title}, page ${citation.page}, chunk ${citation.chunk_id}`);
-        button.addEventListener('click', () => inspectCitation(citation));
-        citations.append(button);
+    let list = null;
+    for (const line of String(text || '').split('\n')) {
+      const heading = line.match(/^(#{1,6})\s+(.+)$/);
+      const item = line.match(/^\s*(?:[-*]|\d+\.)\s+(.+)$/);
+      if (item) {
+        if (!list) { list = node('ul'); fragment.append(list); }
+        list.append(node('li', item[1]));
+      } else {
+        list = null;
+        if (heading) fragment.append(node(`h${Math.min(heading[1].length + 2, 6)}`, heading[2]));
+        else if (line.trim()) fragment.append(node('p', line));
       }
-      fragment.append(citations);
     }
     return fragment;
   }
-
-  document.querySelectorAll('[data-query]').forEach((button) => button.addEventListener('click', () => {
-    $('chat-query').value = button.dataset.query;
-    $('chat-query').focus();
-  }));
+  function providerLabel(diagnostics) {
+    if (diagnostics?.succeeded === true) return `Model response · ${diagnostics.provider || 'provider'} / ${diagnostics.model || 'model'}`;
+    if (diagnostics?.fallback_used === true) return 'Local fallback · model did not succeed';
+    return 'Local / unverified generation · no confirmed model success';
+  }
+  function answerContent(result) {
+    const fragment = document.createDocumentFragment();
+    const badges = node('div', null, 'badge-row');
+    badges.append(node('span', providerLabel(result.provider_status), 'badge violet'), node('span', `Mode: ${result.generation_mode || 'not recorded'}`, 'badge quiet'));
+    if (result.acl_epoch !== undefined) badges.append(node('span', `ACL epoch: ${result.acl_epoch}`, 'badge quiet'));
+    fragment.append(badges);
+    if (result.injection_warning) fragment.append(node('p', 'Injection warning: suspicious source instructions were detected. Review evidence carefully.', 'notice'));
+    const answer = node('div', null, 'answer-text'); answer.append(safeMarkdown(result.answer)); fragment.append(answer);
+    if (!result.citations?.length) fragment.append(node('p', 'No cited evidence was returned. The answer may be access-limited or lack sufficient evidence.', 'small'));
+    else {
+      const citations = node('div', null, 'citations');
+      for (const citation of result.citations) {
+        const button = action(`${citation.title} · p. ${citation.page} ↗`, () => inspectCitation(citation), 'citation');
+        button.setAttribute('aria-label', `Inspect ${citation.title}, page ${citation.page}, chunk ${citation.chunk_id}`); citations.append(button);
+      }
+      fragment.append(citations);
+    }
+    const generation = state.generation;
+    fragment.append(action('Copy answer', async () => {
+      try { await navigator.clipboard.writeText(String(result.answer || '')); if (generation === state.generation) status('Answer copied.'); }
+      catch { if (generation === state.generation) status('Clipboard unavailable. Select the answer text to copy it.', true); }
+    }));
+    return fragment;
+  }
+  function message(role, content, metadata = {}) {
+    const article = node('article', null, role === 'user' ? 'message question' : 'message');
+    article.append(node('h3', role === 'user' ? 'YOU' : 'ORGMIND'));
+    article.append(role === 'user' ? node('p', content, 'question-text') : answerContent({ ...metadata, answer: content }));
+    return article;
+  }
+  document.querySelectorAll('[data-query]').forEach((button) => button.addEventListener('click', () => { $('chat-query').value = button.dataset.query; $('chat-query').focus(); }));
+  $('new-chat').addEventListener('click', () => { clearChat(); loadConversations(); status('New conversation. Document selection is preserved.'); $('chat-query').focus(); });
   $('chat-form').addEventListener('submit', (event) => {
     event.preventDefault();
-    if (!authenticated()) return;
+    if (!authenticated() || state.tasks.has('chat') || state.tasks.has('conversation')) return;
     const query = $('chat-query').value.trim();
-    if (query.length < 2) { status('Enter a question with at least two non-space characters.', true); return; }
-    if (state.tasks.has('chat')) return;
+    if (query.length < 2) { status('Enter a question with at least two characters.', true); return; }
+    const body = { query, document_ids: state.selected.size ? [...state.selected] : null, conversation_id: state.conversation };
     $('chat-empty').hidden = true;
-    const question = node('article', null, 'message question');
-    question.append(node('h3', 'YOU'), node('p', query, 'question-text'));
-    const answer = node('article', null, 'message');
-    answer.append(node('h3', 'ORGMIND'), node('p', 'Retrieving authorized evidence…', 'small'));
-    $('chat-messages').append(question, answer);
-    work('chat', event.submitter || $('chat-form').querySelector('button'), answer, 'Retrieving authorized evidence…', async (request) => {
-      const result = await request('/api/chat', { method: 'POST', body: { query } });
+    const answer = node('article', null, 'message'); answer.append(node('p', 'Retrieving authorized evidence…', 'small'));
+    $('chat-messages').append(message('user', query), answer); $('chat-query').value = '';
+    work('chat', event.submitter, answer, 'Retrieving authorized evidence…', async (request) => {
+      const result = await request('/api/workspace/chat', { method: 'POST', body });
+      state.conversation = result.conversation_id;
       answer.replaceChildren(node('h3', 'ORGMIND'), answerContent(result));
       $('context-epoch').textContent = result.acl_epoch;
       $('chat-messages').scrollTop = $('chat-messages').scrollHeight;
-      status('Answer received. Inspect the citations to review the evidence.');
-    }, (message) => answer.replaceChildren(node('h3', 'REQUEST NOT COMPLETED'), node('p', message, 'notice')));
+      loadConversations(); status('Answer received. Inspect citations to review the evidence.');
+    }, (text) => { answer.replaceChildren(node('h3', 'REQUEST NOT COMPLETED'), node('p', text, 'notice')); $('chat-query').value = query; });
   });
-
+  function loadConversations() {
+    if (!authenticated()) return;
+    empty('conversation-list', 'Loading conversations…');
+    work('conversations', $('refresh-conversations'), $('conversation-list'), 'Loading conversation history…', async (request) => {
+      const data = await request('/api/workspace/conversations');
+      $('conversation-list').replaceChildren();
+      if (!data.conversations.length) { empty('conversation-list', 'No conversations yet. Ask your first question.'); return; }
+      for (const chat of data.conversations) {
+        const row = node('div', null, 'history-row');
+        const open = action(chat.title || 'Untitled conversation', () => openConversation(chat.id));
+        if (state.conversation === chat.id) open.setAttribute('aria-current', 'true');
+        const remove = action('Delete', () => {
+          if (!window.confirm(`Delete conversation “${chat.title}”?`)) return;
+          if (state.conversation === chat.id || state.tasks.has('conversation')) clearChat();
+          work('mutation', remove, row, 'Deleting conversation…', async (request) => {
+            await request(`/api/workspace/conversations/${encodeURIComponent(chat.id)}`, { method: 'DELETE' });
+            if (state.conversation === chat.id) clearChat();
+            loadConversations();
+          });
+        }, 'button danger');
+        remove.setAttribute('aria-label', `Delete conversation ${chat.title}`);
+        row.append(open, node('small', formatDate(chat.updated_at)), remove); $('conversation-list').append(row);
+      }
+    }, (text) => empty('conversation-list', text));
+  }
+  function openConversation(id) {
+    clearChat();
+    work('conversation', null, $('chat-messages'), 'Loading conversation…', async (request) => {
+      const chat = await request(`/api/workspace/conversations/${encodeURIComponent(id)}`);
+      state.conversation = chat.id; state.selected = new Set(chat.document_ids || []); updateSelection();
+      $('chat-empty').hidden = chat.messages.length > 0;
+      $('chat-messages').replaceChildren(...chat.messages.map((item) => message(item.role, item.content, item)));
+      $('context-epoch').textContent = chat.acl_epoch; status('Conversation loaded. Access was checked by the server.');
+    }, (text) => empty('chat-messages', text));
+  }
+  $('refresh-conversations').addEventListener('click', loadConversations);
+  function revokeUrls() { for (const url of state.urls) URL.revokeObjectURL(url); state.urls.clear(); }
   function closeEvidence() {
-    abortTask('citation');
-    if ($('evidence-dialog').open) $('evidence-dialog').close();
-    $('evidence-title').textContent = 'Source evidence';
-    $('evidence-meta').textContent = '';
-    $('evidence-text').textContent = '';
+    abortTask('citation'); abortTask('preview'); abortTask('download');
+    $('evidence-dialog').close(); revokeUrls(); state.preview = null;
+    $('evidence-title').textContent = 'Source evidence'; $('evidence-meta').textContent = ''; $('evidence-text').textContent = '';
+    $('page-preview').replaceChildren(); $('download-result').replaceChildren(); $('page-details').open = false;
   }
   $('close-evidence').addEventListener('click', closeEvidence);
   $('evidence-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeEvidence(); });
-  $('evidence-dialog').addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { event.preventDefault(); closeEvidence(); }
-  });
-  $('evidence-dialog').addEventListener('click', (event) => {
-    if (event.target !== $('evidence-dialog')) return;
-    const box = $('evidence-dialog').getBoundingClientRect();
-    if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) closeEvidence();
-  });
+  function showSource(doc, page = 1) {
+    closeEvidence(); state.preview = doc;
+    $('evidence-title').textContent = doc.title; $('preview-page').value = page;
+    $('preview-page').max = doc.pages || '';
+    $('evidence-dialog').showModal();
+  }
   function inspectCitation(citation) {
     if (!authenticated()) return;
-    closeEvidence();
-    $('evidence-text').textContent = 'Loading source evidence…';
-    $('evidence-dialog').showModal();
+    showSource({ id: citation.document_id, title: citation.title }, citation.page);
+    $('evidence-text').textContent = 'Loading authorized passage…';
     work('citation', null, $('evidence-text'), 'Inspecting cited passage…', async (request) => {
       const source = await request(`/api/documents/${encodeURIComponent(citation.document_id)}/chunks/${encodeURIComponent(citation.chunk_id)}`);
       $('evidence-title').textContent = source.title;
       $('evidence-meta').textContent = `${source.document_id} · Page ${source.page} · Chunk ${source.id}`;
       $('evidence-text').textContent = source.text;
-      status('Citation loaded from the authorized chunk endpoint.');
-    }, (message) => { $('evidence-text').textContent = message; });
+    }, (text) => { $('evidence-text').textContent = text; });
   }
-
+  function previewPage() {
+    if (!state.preview || !authenticated()) return;
+    const page = Number($('preview-page').value);
+    if (!Number.isInteger(page) || page < 1) { status('Choose a valid page number.', true); return; }
+    const doc = state.preview;
+    empty('page-preview', 'Loading original page…');
+    work('preview', null, $('page-preview'), 'Loading authorized PDF page…', async (request) => {
+      const blob = await request(`/api/workspace/documents/${encodeURIComponent(doc.id)}/preview?page=${page}`, { blob: true });
+      if (blob.type !== 'image/png') throw new Error('Expected a PNG page preview.');
+      const url = URL.createObjectURL(blob); state.urls.add(url);
+      const image = node('img'); image.src = url; image.alt = `${doc.title}, page ${page}`;
+      $('page-preview').replaceChildren(image);
+    }, (text) => empty('page-preview', text));
+  }
+  $('page-details').addEventListener('toggle', () => { if ($('page-details').open) previewPage(); else abortTask('preview'); });
+  $('page-form').addEventListener('submit', (event) => { event.preventDefault(); previewPage(); });
+  function downloadDocument(doc) {
+    showSource(doc); $('evidence-text').textContent = 'Preparing authorized PDF download…';
+    work('download', null, $('download-result'), 'Downloading authorized original…', async (request) => {
+      const blob = await request(`/api/workspace/documents/${encodeURIComponent(doc.id)}/download`, { blob: true });
+      if (blob.type !== 'application/pdf') throw new Error('Expected a PDF original.');
+      const url = URL.createObjectURL(blob); state.urls.add(url);
+      const link = node('a', 'Save PDF', 'button primary'); link.href = url; link.download = doc.filename || `${doc.id}.pdf`;
+      $('download-result').replaceChildren(link); $('evidence-text').textContent = 'Your PDF is ready. Save it before closing this window.';
+    }, (text) => empty('download-result', text));
+  }
   $('compare-form').addEventListener('submit', (event) => {
-    event.preventDefault();
-    if (!authenticated(true)) return;
+    event.preventDefault(); if (!authenticated(true)) return;
     const query = $('compare-query').value.trim();
-    if (query.length < 2) { status('Enter a question with at least two non-space characters.', true); return; }
-    empty('compare-results', 'Generating five live, permission-aware responses…');
-    work('compare', event.submitter || $('compare-form').querySelector('button'), $('compare-results'), 'Comparing live backend personas…', async (request) => {
+    if (query.length < 2) { status('Enter a question with at least two characters.', true); return; }
+    empty('compare-results', 'Generating live, permission-aware responses…');
+    work('compare', event.submitter, $('compare-results'), 'Comparing authorized roles…', async (request) => {
       const data = await request('/api/chat/compare-roles', { method: 'POST', body: { query } });
       $('compare-results').replaceChildren(...data.results.map((result) => {
-        const card = node('article', null, 'card result-card');
-        card.append(node('h2', result.role), node('p', result.persona_id, 'small'), answerContent(result));
-        return card;
+        const card = node('article', null, 'card result-card'); card.append(node('h2', result.role), node('p', result.persona_id, 'small'), answerContent(result)); return card;
       }));
-      status(`${data.results.length} live role responses returned.`);
-    }, (message) => empty('compare-results', message));
+    }, (text) => empty('compare-results', text));
   });
-
   function table(columns, rows, title) {
     const wrapper = node('div', null, 'table-wrap');
     wrapper.tabIndex = 0;
@@ -356,7 +397,7 @@
 
   $('sql-form').addEventListener('submit', (event) => {
     event.preventDefault();
-    if (!authenticated()) return;
+    if (!authenticated(true)) return;
     const body = { metric_id: $('metric').value };
     if ($('period').value.trim()) body.period = $('period').value.trim();
     empty('sql-results', 'Running the approved metric…');
@@ -385,97 +426,6 @@
       }
       status('Metric query complete. The table and chart use the returned rows.');
     }, (message) => empty('sql-results', message));
-  });
-
-  function scopeFields(fieldset, selected = []) {
-    const legend = fieldset.querySelector('legend');
-    fieldset.replaceChildren(legend || node('legend', 'Allowed scopes (select at least one)'));
-    for (const scope of state.config?.scopes ?? []) {
-      const label = node('label', null, 'scope-option');
-      const checkbox = node('input');
-      checkbox.type = 'checkbox';
-      checkbox.name = 'allowed_scopes';
-      checkbox.value = scope;
-      checkbox.checked = selected.includes(scope);
-      label.append(checkbox, node('span', scope));
-      fieldset.append(label);
-    }
-  }
-  const selectedScopes = (container) => [...container.querySelectorAll('input[name="allowed_scopes"]:checked')].map((input) => input.value);
-
-  function documentChanged(epoch, message) {
-    clearEvidence();
-    if (epoch !== undefined) {
-      state.user.acl_epoch = epoch;
-      $('context-epoch').textContent = epoch;
-    } else $('context-epoch').textContent = 'Refresh on next response';
-    status(`${message} Previous evidence and benchmark results have been cleared.`);
-    loadDocuments();
-    loadAudit();
-  }
-  function renderDocuments(documents) {
-    const target = $('document-list');
-    target.replaceChildren();
-    if (!documents.length) { empty('document-list', 'No documents are currently visible. Upload a synthetic PDF to begin.'); return; }
-    for (const doc of documents) {
-      const card = node('article', null, 'card document-card');
-      card.append(node('h3', doc.title), node('p', `${doc.id} · ${doc.pages} pages · ${doc.chunks} indexed chunks`, 'small'));
-      const form = node('form');
-      const fields = node('fieldset');
-      scopeFields(fields, doc.allowed_scopes);
-      const actions = node('div', null, 'document-actions');
-      const save = node('button', 'Save scopes', 'button secondary');
-      save.type = 'submit';
-      const remove = node('button', 'Delete document', 'button danger');
-      remove.type = 'button';
-      actions.append(save, remove);
-      form.append(fields, actions);
-      card.append(form);
-      form.addEventListener('submit', (event) => {
-        event.preventDefault();
-        if (!authenticated(true)) return;
-        const scopes = selectedScopes(fields);
-        if (!scopes.length) { status('Select at least one allowed scope before saving.', true); return; }
-        work('mutation', save, card, 'Saving document scopes…', async (request) => {
-          const result = await request(`/api/documents/${encodeURIComponent(doc.id)}/permissions`, { method: 'PATCH', body: { allowed_scopes: scopes } });
-          documentChanged(result.acl_epoch, 'Document scopes saved.');
-        });
-      });
-      remove.addEventListener('click', () => {
-        if (!authenticated(true) || !window.confirm(`Delete “${doc.title}” and its indexed chunks? This cannot be undone. Deleting a seeded document can invalidate the fixed benchmark.`)) return;
-        work('mutation', remove, card, 'Deleting document and indexed chunks…', async (request) => {
-          await request(`/api/documents/${encodeURIComponent(doc.id)}`, { method: 'DELETE' });
-          documentChanged(undefined, 'Document deleted.');
-        });
-      });
-      target.append(card);
-    }
-  }
-  function loadDocuments() {
-    if (!authenticated(true)) return;
-    empty('document-list', 'Loading the document library…');
-    work('documents', $('refresh-documents'), $('document-list'), 'Loading current document access…', async (request) => {
-      const data = await request('/api/documents');
-      renderDocuments(data.documents);
-      status(`${data.documents.length} documents loaded with current scopes.`);
-    }, (message) => empty('document-list', message));
-  }
-  $('refresh-documents').addEventListener('click', loadDocuments);
-  $('upload-form').addEventListener('submit', (event) => {
-    event.preventDefault();
-    if (!authenticated(true)) return;
-    const file = $('pdf-file').files[0];
-    const scopes = selectedScopes($('upload-scopes'));
-    if (!file || !scopes.length) { status('Choose a PDF and at least one allowed scope.', true); return; }
-    if (file.type && file.type !== 'application/pdf') { status('Only PDF documents are accepted.', true); return; }
-    const form = new FormData();
-    form.append('file', file.type ? file : new File([file], file.name, { type: 'application/pdf' }));
-    form.append('allowed_scopes', JSON.stringify(scopes));
-    work('mutation', event.submitter || $('upload-form').querySelector('button'), $('upload-form'), 'Uploading and indexing the PDF…', async (request) => {
-      const result = await request('/api/documents/upload', { method: 'POST', body: form });
-      $('upload-form').reset();
-      documentChanged(result.acl_epoch, `Document ${result.document_id} uploaded and indexed.`);
-    });
   });
 
   function rawDetails(label, data) {
@@ -551,42 +501,260 @@
     }, (message) => empty('benchmark-results', message));
   });
 
-  // Authentication never persists across reloads or browser history restoration.
-  window.addEventListener('pagehide', () => resetSession('Signed out. Reload or choose a persona to begin a new session.'));
-  window.addEventListener('pageshow', (event) => {
-    if (event.persisted) {
-      resetSession('Restored page is signed out. Choose a persona to begin a new session.');
-      if (!state.config) loadConfig();
-    }
-  });
-  function loadConfig() {
-    work('config', null, null, 'Loading workspace configuration…', async (request) => {
-      const config = await request('/api/config', { publicRequest: true });
-      state.config = config;
-      const select = $('persona');
-      select.replaceChildren();
-      for (const [id, role] of Object.entries(config.personas)) {
-        const option = node('option', `${role} · ${id}`);
-        option.value = id;
-        select.append(option);
-      }
-      if (Object.hasOwn(config.personas, 'general_user')) select.value = 'general_user';
-      select.disabled = !config.demo_enabled || !select.options.length;
-      $('demo-form').hidden = !config.demo_enabled;
-      $('demo-note').textContent = config.demo_enabled ? 'Choose a persona, then explicitly enter the demo.' : 'Demo access is disabled by the server. Sign in with your credentials.';
-      $('credentials').open = !config.demo_enabled && !state.user;
-      scopeFields($('upload-scopes'));
-      updateSession();
-      if (!state.tasks.has('auth')) {
-        status(state.user ? `Signed in as ${state.user.id}. Workspace configuration loaded.`
-          : (config.demo_enabled ? 'Signed out · Choose a demo persona and enter the workspace to begin.' : 'Signed out · Use your credentials to access this workspace.'));
-      }
-    }, () => {
-      $('persona').replaceChildren(node('option', 'Configuration unavailable'));
-      $('demo-note').textContent = 'Configuration could not be loaded. Reload to retry, or sign in with credentials.';
-      $('credentials').open = true;
-    });
+  function action(label, handler, className = 'button secondary') {
+    const button = node('button', label, className); button.type = 'button'; button.addEventListener('click', handler); return button;
   }
-  updateSession();
-  loadConfig();
+  function formatDate(value) {
+    if (!value) return 'Not recorded';
+    const date = new Date(value); return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+  function field(form, label, value = '', type = 'text', required = false) {
+    const input = node('input'); input.id = `field-${++elementId}`; input.type = type; input.value = value ?? ''; input.required = required;
+    const caption = node('label', label); caption.htmlFor = input.id; form.append(caption, input); return input;
+  }
+  function selectField(form, label, options, value) {
+    const select = node('select'); select.id = `field-${++elementId}`;
+    for (const [id, text] of options) { const option = node('option', text); option.value = id; select.append(option); }
+    select.value = value ?? ''; const caption = node('label', label); caption.htmlFor = select.id; form.append(caption, select); return select;
+  }
+  function submitButton(form, label) { const button = node('button', label, 'button primary'); button.type = 'submit'; form.append(button); return button; }
+  function updateSelection() {
+    const count = state.selected.size;
+    $('document-selection').textContent = count ? `${count} document${count === 1 ? '' : 's'} selected` : 'No documents selected';
+    $('chat-selection').textContent = count ? `Chat context: ${count} selected document${count === 1 ? '' : 's'}` : 'Chat context: all authorized documents';
+    $('chat-selected').disabled = !count;
+    document.querySelectorAll('[data-document-select]').forEach((input) => { input.checked = state.selected.has(input.dataset.documentSelect); });
+  }
+  function changeSelection(id, checked) {
+    clearChat();
+    if (checked) state.selected.add(id); else state.selected.delete(id);
+    updateSelection();
+  }
+  $('clear-selection').addEventListener('click', () => { clearChat(); state.selected.clear(); updateSelection(); });
+  $('chat-selected').addEventListener('click', () => { if (!state.selected.size) return; clearChat(); selectTab('assistant'); $('chat-query').focus(); });
+  function documentChanged(text) {
+    clearChat(); abortTask('conversations'); abortTask('compare'); abortTask('benchmark');
+    $('compare-results').replaceChildren(); $('benchmark-results').replaceChildren(); $('conversation-list').replaceChildren();
+    state.selected.clear(); updateSelection(); loadDocuments(); status(`${text} Previous evidence cleared.`);
+  }
+  function scopeFields(fieldset, selected = []) {
+    fieldset.replaceChildren(node('legend', 'Allowed scopes'));
+    for (const scope of state.config?.scopes || []) {
+      const label = node('label', null, 'scope-option'); const input = node('input');
+      input.type = 'checkbox'; input.name = 'allowed_scopes'; input.value = scope; input.checked = selected.includes(scope);
+      label.append(input, node('span', scope)); fieldset.append(label);
+    }
+  }
+  function renderDocuments(documents) {
+    state.documents = documents;
+    $('document-list').replaceChildren();
+    if (!documents.length) { empty('document-list', 'No documents match. Try another filter or upload a private PDF.'); return; }
+    for (const doc of documents) {
+      const card = node('article', null, 'card document-card');
+      const check = node('input'); check.type = 'checkbox'; check.dataset.documentSelect = doc.id; check.checked = state.selected.has(doc.id);
+      check.disabled = doc.status !== 'indexed';
+      const label = node('label', null, 'scope-option'); label.append(check, node('span', `Select ${doc.title}`));
+      check.addEventListener('change', () => changeSelection(doc.id, check.checked));
+      card.append(node('h3', doc.title), label, node('p', doc.filename || doc.id, 'small'));
+      const badges = node('div', null, 'badge-row');
+      badges.append(node('span', doc.status, `badge ${doc.status === 'failed' ? 'failed' : 'quiet'}`), node('span', doc.visibility || 'private', 'badge quiet'));
+      card.append(badges, node('p', `${doc.pages ?? 0} pages · ${doc.chunks ?? 0} chunks`, 'small'), node('p', `Owner: ${doc.owner || doc.owner_id || 'Not recorded'} · Department: ${doc.department || 'None'}`, 'small'), node('p', `Uploaded: ${formatDate(doc.uploaded_at)}`, 'small'));
+      if (doc.status === 'processing' || doc.status === 'uploaded') card.append(node('p', 'Not ready for chat yet. Refresh the library to check indexing progress.', 'notice'));
+      if (doc.status === 'failed') card.append(node('p', 'Indexing failed. Reindex if available, or contact an administrator.', 'notice'));
+      const actions = node('div', null, 'document-actions');
+      if (doc.has_original) {
+        actions.append(action('Preview PDF', () => { showSource(doc); $('evidence-text').textContent = 'Original PDF page preview.'; $('page-details').open = true; }), action('Download PDF', () => downloadDocument(doc)));
+      } else actions.append(node('p', 'Original PDF unavailable. Indexed citations remain inspectable.', 'small'));
+      if (doc.can_reindex) {
+        const reindex = action('Reindex', () => work('mutation', reindex, card, 'Reindexing PDF…', async (request) => {
+          const result = await request(`/api/workspace/documents/${encodeURIComponent(doc.id)}/reindex`, { method: 'POST' }); documentChanged(`Document status: ${result.status}.`);
+        })); actions.append(reindex);
+      }
+      if (doc.can_delete) {
+        const remove = action('Delete document', () => {
+          if (!window.confirm(`Delete “${doc.title}” and its indexed content? This cannot be undone.`)) return;
+          work('mutation', remove, card, 'Deleting document…', async (request) => {
+            await request(`/api/workspace/documents/${encodeURIComponent(doc.id)}`, { method: 'DELETE' }); documentChanged('Document deleted.');
+          });
+        }, 'button danger'); actions.append(remove);
+      }
+      card.append(actions);
+      if (state.user.role === 'admin') {
+        const details = node('details', null, 'raw-details'); details.append(node('summary', 'Manage document access'));
+        const form = node('form');
+        const visibility = selectField(form, 'Visibility', [['private','Private — owner only'],['scoped','Shared with allowed scopes']], doc.visibility);
+        const scopes = node('fieldset'); scopeFields(scopes, doc.allowed_scopes || []); form.append(scopes);
+        const syncScopes = () => { scopes.disabled = visibility.value === 'private'; };
+        visibility.addEventListener('change', syncScopes); syncScopes();
+        const save = submitButton(form, 'Save permissions');
+        form.addEventListener('submit', (event) => {
+          event.preventDefault(); if (!authenticated(true)) return;
+          const allowed_scopes = visibility.value === 'private' ? [] : [...scopes.querySelectorAll('input:checked')].map((input) => input.value);
+          if (visibility.value === 'scoped' && !allowed_scopes.length) { status('Select at least one allowed scope.', true); return; }
+          work('mutation', save, card, 'Saving document permissions…', async (request) => {
+            await request(`/api/workspace/documents/${encodeURIComponent(doc.id)}/permissions`, { method: 'PATCH', body: { visibility: visibility.value, allowed_scopes } }); documentChanged('Permissions saved.');
+          });
+        });
+        details.append(form); card.append(details);
+      }
+      $('document-list').append(card);
+    }
+    updateSelection();
+  }
+  function loadDocuments() {
+    if (!authenticated()) return;
+    empty('document-list', 'Loading authorized documents…');
+    const params = new URLSearchParams({ q: $('document-search').value.trim(), status: $('document-status').value });
+    work('documents', $('refresh-documents'), $('document-list'), 'Loading document library…', async (request) => {
+      const data = await request(`/api/workspace/documents?${params}`); renderDocuments(data.documents); status(`${data.documents.length} documents found.`);
+    }, (text) => empty('document-list', text));
+  }
+  $('document-filter').addEventListener('submit', (event) => { event.preventDefault(); loadDocuments(); });
+  $('document-status').addEventListener('change', loadDocuments);
+  $('upload-form').addEventListener('submit', (event) => {
+    event.preventDefault(); if (!authenticated()) return;
+    const file = $('pdf-file').files[0];
+    if (!file || (file.type && file.type !== 'application/pdf')) { status('Choose a PDF document.', true); return; }
+    const form = new FormData(); form.append('file', file);
+    work('mutation', event.submitter, $('upload-form'), 'Uploading private PDF…', async (request) => {
+      const doc = await request('/api/workspace/documents/upload', { method: 'POST', body: form });
+      $('upload-form').reset(); $('document-filter').reset(); documentChanged(`Uploaded ${doc.title}. Status: ${doc.status}.`);
+    });
+  });
+  function loadOverview() {
+    if (!authenticated(true)) return;
+    empty('overview-results', 'Loading organization overview…');
+    work('overview', $('refresh-overview'), $('overview-results'), 'Loading overview…', async (request) => {
+      const data = await request('/api/admin/overview'); const stats = node('div', null, 'stat-grid');
+      for (const [key, label] of [['users','Total users'],['active_users','Active users'],['inactive_users','Inactive users'],['active_admins','Active administrators'],['departments','Departments'],['documents','Documents'],['chunks','Indexed chunks'],['audit_logs','Audit events'],['acl_epoch','Access policy epoch']]) {
+        const card = node('article', null, 'card stat-card'); card.append(node('p', label, 'small'), node('strong', data[key] ?? 'Not available')); stats.append(card);
+      }
+      $('overview-results').replaceChildren(stats); status('Organization overview updated.');
+    }, (text) => empty('overview-results', text));
+  }
+  $('refresh-overview').addEventListener('click', loadOverview);
+  function renderProfile() {
+    if (!state.user) return;
+    const user = state.user; const list = node('dl', null, 'context-list');
+    for (const [key, value] of [['Name',user.name],['Account ID',user.id],['Email',user.email],['Role',user.role],['Department',user.department?.name],['Status',user.active ? 'Active' : 'Inactive'],['Authorized scopes',user.scopes.join(', ')]]) {
+      const row = node('div'); row.append(node('dt',key),node('dd',value || 'Not set')); list.append(row);
+    }
+    $('profile-results').replaceChildren(list, node('p','Contact your administrator to update your account.', 'small'));
+  }
+  function loadUsers() {
+    if (!authenticated(true)) return;
+    empty('users-results', 'Loading users…'); empty('roles-results','Loading roles…');
+    work('users', $('refresh-users'), $('users-results'), 'Loading accounts and roles…', async (request) => {
+      const [users, roles, departments] = await Promise.all([request('/api/admin/users'),request('/api/admin/roles'),request('/api/admin/departments')]);
+      state.roles = roles.roles; state.departments = departments.departments;
+      $('users-results').replaceChildren();
+      if (!users.users.length) empty('users-results','No accounts found. Add a user to begin.');
+      for (const user of users.users) {
+        const card = node('article',null,'card account-row');
+        const info = node('div'); info.append(node('h3',user.name || user.id),node('p',`${user.email || user.id} · ${user.role} · ${user.department?.name || 'No department'}`, 'small'),node('span',user.active ? 'Active' : 'Inactive','badge quiet'));
+        const edit = action('Edit user', () => editUser(user)); edit.setAttribute('aria-label',`Edit user ${user.name || user.id}`);
+        card.append(info,edit); $('users-results').append(card);
+      }
+      $('roles-results').replaceChildren(...roles.roles.map((role) => {
+        const card = node('article',null,'card document-card'); card.append(node('h3',role.name),node('p',`${role.user_count} accounts`, 'small'),node('p',`Scopes: ${role.scopes.join(', ')}`,'small')); return card;
+      }));
+      status('Users and roles updated.');
+    }, (text) => { empty('users-results',text); empty('roles-results','Roles unavailable. Refresh to retry.'); });
+  }
+  function editUser(user = null) {
+    if (!authenticated(true)) return;
+    if (!state.roles.length) { status('Load users & roles before editing accounts.', true); return; }
+    const form = node('form',null,'card query-card account-form'); form.append(node('h2',user ? 'Edit user' : 'Add user'));
+    const name = field(form,'Full name',user?.name,'text',true); name.maxLength = 200;
+    const username = user ? null : field(form,'Username','','text',true); if (username) { username.maxLength = 100; username.autocomplete = 'off'; }
+    const email = field(form,'Email',user?.email,'email'); email.maxLength = 254;
+    const password = field(form,user ? 'New password (leave blank to keep unchanged)' : 'Initial password','','password',!user); password.minLength = 12; password.maxLength = 256; password.autocomplete = 'new-password';
+    const role = selectField(form,'Role',state.roles.map((item) => [item.id,item.name]),user?.role || 'employee');
+    const department = selectField(form,'Department',[['','No department'],...state.departments.map((item) => [item.id,item.name])],user?.department_id || '');
+    const active = field(form,'Account active','','checkbox'); active.checked = user ? user.active : true;
+    const save = submitButton(form,'Save user'); form.append(action('Cancel', () => $('user-editor').replaceChildren()));
+    form.addEventListener('submit',(event) => {
+      event.preventDefault();
+      const body = { name: name.value.trim(), email: email.value.trim() || null, department_id: department.value || null, role: role.value, active: active.checked };
+      if (!body.name || (username && !username.value.trim())) { status('Name and username cannot be blank.',true); return; }
+      if (username) body.username = username.value.trim();
+      if (password.value) body.password = password.value;
+      work('mutation',save,form,'Saving user…',async (request) => {
+        try {
+          await request(user ? `/api/admin/users/${encodeURIComponent(user.id)}` : '/api/admin/users',{ method: user ? 'PATCH' : 'POST',body });
+          $('user-editor').replaceChildren();
+          if (user?.id === state.user.id) { resetSession('Your account changed. Sign in again to refresh your identity.'); return; }
+          loadUsers(); status('User saved.');
+        } finally { delete body.password; password.value = ''; }
+      });
+    });
+    $('user-editor').replaceChildren(form); name.focus();
+  }
+  $('new-user').addEventListener('click',() => editUser()); $('refresh-users').addEventListener('click',loadUsers);
+  function loadDepartments() {
+    if (!authenticated(true)) return;
+    empty('departments-results','Loading departments…');
+    work('departments',$('refresh-departments'),$('departments-results'),'Loading departments…',async (request) => {
+      const data = await request('/api/admin/departments'); state.departments = data.departments;
+      $('departments-results').replaceChildren();
+      if (!data.departments.length) { empty('departments-results','No departments yet. Add a department to organize your team.'); return; }
+      for (const department of data.departments) {
+        const card = node('article',null,'card account-row'); const info = node('div');
+        info.append(node('h3',department.name),node('p',department.description || 'No description','small'),node('p',`${department.user_count ?? 0} accounts · ${department.id}`,'small'));
+        const actions = node('div',null,'document-actions'); const remove = action('Delete department',() => {
+          if (!window.confirm(`Delete department “${department.name}”? Assigned accounts may prevent deletion.`)) return;
+          work('mutation',remove,card,'Deleting department…',async (request) => {
+            await request(`/api/admin/departments/${encodeURIComponent(department.id)}`,{method:'DELETE'}); loadDepartments(); status('Department deleted.');
+          });
+        },'button danger');
+        actions.append(action('Edit department',() => editDepartment(department)),remove); card.append(info,actions); $('departments-results').append(card);
+      }
+      status('Departments updated.');
+    },(text) => empty('departments-results',text));
+  }
+  function editDepartment(department = null) {
+    if (!authenticated(true)) return;
+    const form = node('form',null,'card query-card account-form'); form.append(node('h2',department ? 'Edit department' : 'Add department'));
+    const name = field(form,'Department name',department?.name,'text',true); name.maxLength = 200;
+    const description = field(form,'Description',department?.description); description.maxLength = 2000;
+    const save = submitButton(form,'Save department'); form.append(action('Cancel',() => $('department-editor').replaceChildren()));
+    form.addEventListener('submit',(event) => {
+      event.preventDefault();
+      const body = {name:name.value.trim(),description:description.value.trim()};
+      if (!body.name) { status('Department name cannot be blank.',true); return; }
+      work('mutation',save,form,'Saving department…',async (request) => {
+        await request(department ? `/api/admin/departments/${encodeURIComponent(department.id)}` : '/api/admin/departments',{method:department ? 'PATCH' : 'POST',body});
+        $('department-editor').replaceChildren();
+        if (department?.id === state.user.department_id) { resetSession('Your department changed. Sign in again to refresh your identity.'); return; }
+        loadDepartments(); status('Department saved.');
+      });
+    });
+    $('department-editor').replaceChildren(form); name.focus();
+  }
+  $('new-department').addEventListener('click',() => editDepartment()); $('refresh-departments').addEventListener('click',loadDepartments);
+  function loadProvider() {
+    if (!authenticated(true)) return;
+    empty('provider-results','Loading recorded AI status…');
+    work('provider',$('refresh-provider'),$('provider-results'),'Loading recorded provider outcomes…',async (request) => {
+      const data = await request('/api/admin/provider-status'); const target = $('provider-results');
+      const card = node('article',null,'card document-card');
+      card.append(node('h2',providerLabel(data.last_generation)),node('p',`${data.successful_generations} successful generations · ${data.fallback_generations} fallback generations`),node('p',data.note,'notice'));
+      if (data.last_generation) {
+        const info = data.last_generation;
+        card.append(table(['provider','model','http_status','error_category','succeeded','fallback_used'],[info],'Last recorded generation'));
+      } else card.append(node('p','No generation has been recorded in this process.','empty-state'));
+      target.replaceChildren(card); status('AI status reflects recorded requests, not a live provider probe.');
+    },(text) => empty('provider-results',text));
+  }
+  $('refresh-provider').addEventListener('click',loadProvider);
+  function loadConfig() {
+    work('config',null,null,'Loading workspace configuration…',async (request) => {
+      state.config = await request('/api/config',{publicRequest:true});
+      if (!state.user && !$('login-dialog').open) status('Sign in to access your workspace.');
+    },() => status('Scope configuration unavailable. Sign-in remains available; reload before sharing document permissions.',true));
+  }
+  // Never restore authentication from browser storage or the back-forward cache.
+  window.addEventListener('pagehide',() => resetSession('Signed out. Sign in to start a new session.'));
+  window.addEventListener('pageshow',(event) => { if (event.persisted) { resetSession('Restored page is signed out.'); if (!state.config) loadConfig(); } });
+  updateSession(); updateSelection(); loadConfig();
 })();

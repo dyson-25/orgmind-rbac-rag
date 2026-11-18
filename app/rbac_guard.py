@@ -24,11 +24,21 @@ def validate_scopes(scopes):
     return sorted(set(scopes))
 
 
-def authorized_chunk_ids(conn, user):
+def authorized_document_ids(conn, user):
+    if user['role'] == 'admin':
+        return {row[0] for row in conn.execute('SELECT id FROM documents')}
     scopes = authorized_scopes(user)
     return {row[0] for row in conn.execute(
-        'SELECT c.id FROM chunks c WHERE EXISTS (SELECT 1 FROM document_scopes s '
-        f'WHERE s.document_id=c.document_id AND s.scope IN ({",".join("?" for _ in scopes)}))', scopes)}
+        "SELECT d.id FROM documents d WHERE (d.visibility='private' AND d.owner_id=?) "
+        "OR (d.visibility='scoped' AND EXISTS (SELECT 1 FROM document_scopes s "
+        f'WHERE s.document_id=d.id AND s.scope IN ({",".join("?" for _ in scopes)})))',
+        (user['id'], *scopes))}
+
+
+def authorized_chunk_ids(conn, user):
+    allowed = authorized_document_ids(conn, user)
+    return {row['id'] for row in conn.execute('SELECT id,document_id FROM chunks')
+            if row['document_id'] in allowed}
 
 
 def validate_citations(citations, allowed):

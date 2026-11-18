@@ -5,7 +5,9 @@ Credentials come only from AZURE_OPENAI_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY
 Azure also requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT; optional
 AZURE_OPENAI_API_VERSION defaults to 2024-10-21. OPENAI_MODEL/GROQ_MODEL and
 OPENAI_BASE_URL/GROQ_BASE_URL override the compatible provider defaults.
-GENERATION_TIMEOUT_SECONDS defaults to 15. No tools are exposed.
+GENERATION_TIMEOUT_SECONDS defaults to 15 per attempt. Gemini omits temperature
+and retries only 429/503, at most twice. last_diagnostics is separate from the
+legacy generate result. No tools are exposed.
 
 EMBEDDING_PROVIDER is independent and defaults to local (embed returns None so
 callers can retain LSA). External embeddings support azure/openai, with separate
@@ -22,7 +24,8 @@ import json
 import math
 import os
 import re
-from urllib.parse import quote
+import time
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -125,6 +128,13 @@ class SpyLLMRecorder:
         self.calls = []
         self.provider = getattr(delegate, 'provider', 'spy')
 
+    @property
+    def last_diagnostics(self):
+        if isinstance(self.delegate, (HTTPGenerationAdapter, SpyLLMRecorder)):
+            diagnostic = self.delegate.last_diagnostics
+            return dict(diagnostic) if diagnostic is not None else None
+        return None
+
     def generate(self, messages):
         self.messages = copy.deepcopy(messages)
         self.calls.append(self.messages)
@@ -165,30 +175,142 @@ def _provider_request(provider, operation):
     return (f'{base}/{operation}', {'Authorization': f'Bearer {_required_env(prefix + "_API_KEY")}'}, {}, model)
 
 
+def _diagnostics(provider, model=None):
+    # Only bounded identifiers, never URLs, headers, response bodies or exception text.
+    safe_model = model if isinstance(model, str) and re.fullmatch(r'[\w./-]{1,128}', model, re.ASCII) else None
+    return {
+        'provider': provider if provider in {'local', 'openai', 'groq', 'azure', 'gemini', 'spy'} else 'custom',
+        'model': safe_model, 'http_status': None, 'error_category': None,
+        'succeeded': False, 'fallback_used': False,
+    }
+
+
+def _is_gemini_url(url):
+    return urlsplit(url).hostname == 'generativelanguage.googleapis.com'
+
+
+def _validate_provider_url(url):
+    parsed = urlsplit(url)
+    if (parsed.scheme not in {'http', 'https'} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment):
+        raise ValueError('Invalid provider URL')
+    if _is_gemini_url(url) and parsed.scheme != 'https':
+        raise ValueError('Gemini requires HTTPS')
+
+
+def _http_error_category(status):
+    if status == 401:
+        return 'auth'
+    if status == 403:
+        return 'permission'
+    if status == 429:
+        return 'quota'
+    if status == 404:
+        return 'model'
+    if status in {408, 504}:
+        return 'timeout'
+    if status >= 500:
+        return 'service'
+    return 'config'
+
+
+def _provider_http_request(method, url, diagnostics, **kwargs):
+    """Shared transport for generation and the prompt-only Gemini diagnostic CLI.
+
+    Retry only Gemini 429/503, at most three attempts with 0.25/0.5s waits.
+    Untrusted Retry-After values cannot extend this bound. Status is the final
+    attempt's code (None if that attempt received no HTTP response).
+    """
+    attempts = 3 if _is_gemini_url(url) else 1
+    for attempt in range(attempts):
+        diagnostics['http_status'] = None
+        try:
+            response = getattr(httpx, method)(url, follow_redirects=False, **kwargs)
+        except httpx.TimeoutException:
+            diagnostics['error_category'] = 'timeout'
+            break
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol, ValueError):
+            diagnostics['error_category'] = 'config'
+            break
+        except Exception:
+            diagnostics['error_category'] = 'service'
+            break
+        diagnostics['http_status'] = response.status_code
+        if response.status_code in {429, 503} and attempt + 1 < attempts:
+            response.close()
+            time.sleep(0.25 * (2 ** attempt))
+            continue
+        if not 200 <= response.status_code < 300:
+            diagnostics['error_category'] = _http_error_category(response.status_code)
+            response.close()
+            break
+        diagnostics['error_category'] = None
+        return response
+    raise RuntimeError('Generation provider unavailable') from None
+
+
+def _completion_text(response):
+    choice = response.json()['choices'][0]
+    if choice.get('finish_reason') not in (None, 'stop'):
+        raise ValueError('Incomplete provider response')
+    message = choice['message']
+    if message.get('tool_calls') or message.get('function_call'):
+        raise ValueError('Tools are not supported')
+    text = message['content']
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError('Empty provider response')
+    return text.strip()
+
+
 class HTTPGenerationAdapter:
-    """Minimal synchronous chat adapter; configuration is read only on invocation."""
+    """Synchronous chat adapter with safe per-call diagnostics, not raw errors."""
 
     def __init__(self, provider):
         self.provider = provider
+        self.last_diagnostics = _diagnostics(provider)
 
     def generate(self, messages):
-        url, headers, params, model = _provider_request(self.provider, 'chat/completions')
-        payload = {'messages': messages, 'temperature': 0}
-        if model is not None:
-            payload['model'] = model
-        response = httpx.post(url, headers=headers, params=params, json=payload,
-                              timeout=_timeout('GENERATION_TIMEOUT_SECONDS'))
-        response.raise_for_status()
-        choice = response.json()['choices'][0]
-        if choice.get('finish_reason') not in (None, 'stop'):
-            raise ValueError('Incomplete provider response')
-        message = choice['message']
-        if message.get('tool_calls') or message.get('function_call'):
-            raise ValueError('Tools are not supported')
-        text = message['content']
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError('Empty provider response')
-        return text.strip()
+        self.last_diagnostics = _diagnostics(self.provider)
+        diagnostic = self.last_diagnostics
+        phase = 'config'
+        try:
+            configured_model = (
+                os.getenv('AZURE_OPENAI_DEPLOYMENT') if self.provider == 'azure' else
+                os.getenv('OPENAI_MODEL', 'gpt-4o-mini') if self.provider == 'openai' else
+                os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile') if self.provider == 'groq' else None
+            )
+            diagnostic['model'] = _diagnostics(self.provider, configured_model)['model']
+            if self.provider == 'openai' and _is_gemini_url(os.getenv('OPENAI_BASE_URL', '')):
+                diagnostic['provider'] = 'gemini'
+            url, headers, params, model = _provider_request(self.provider, 'chat/completions')
+            _validate_provider_url(url)
+            timeout = _timeout('GENERATION_TIMEOUT_SECONDS')
+            gemini = self.provider == 'openai' and _is_gemini_url(url)
+            if gemini:
+                diagnostic['provider'] = 'gemini'
+            if model is not None and (not isinstance(model, str) or not model.strip()):
+                raise ValueError('Missing model')
+            payload = {'messages': messages}
+            if not gemini:
+                payload['temperature'] = 0
+            if model is not None:
+                payload['model'] = model
+            phase = 'service'
+            response = _provider_http_request(
+                'post', url, diagnostic, headers=headers, params=params, json=payload, timeout=timeout,
+            )
+            phase = 'malformed'
+            try:
+                text = _completion_text(response)
+            finally:
+                response.close()
+            diagnostic['succeeded'] = True
+            return text
+        except Exception:
+            diagnostic['error_category'] = diagnostic['error_category'] or phase
+            diagnostic['fallback_used'] = True
+            raise RuntimeError('Generation provider unavailable') from None
 
 
 class LLMService:
@@ -197,9 +319,12 @@ class LLMService:
         self.adapter = adapter if adapter is not None else (
             None if provider == 'local' else HTTPGenerationAdapter(provider)
         )
+        self.last_diagnostics = _diagnostics(getattr(self.adapter, 'provider', 'local' if self.adapter is None else 'custom'))
 
     def generate(self, query, chunks):
-        """Answer only from caller-authorized context, quarantining flagged chunks."""
+        """Keep the legacy result exact; last_diagnostics describes this invocation."""
+        self.last_diagnostics = _diagnostics(getattr(self.adapter, 'provider', 'local' if self.adapter is None else 'custom'))
+        self.last_diagnostics['fallback_used'] = True
         safe_chunks = []
         warning = injection_indicators(query)
         for chunk in chunks:
@@ -218,16 +343,35 @@ class LLMService:
             return result
         try:
             text = self.adapter.generate(messages)
+            self.last_diagnostics['succeeded'] = isinstance(text, str) and bool(text.strip())
             # Observe the empty-context adapter boundary, but never accept unsupported output.
             if citations and text is not None:
                 if not isinstance(text, str) or not text.strip():
+                    self.last_diagnostics['error_category'] = 'malformed'
                     raise ValueError('Invalid adapter response')
                 text = text.strip()
                 result.update(answer=text, citations=[] if text == DENIAL else _citations(safe_chunks),
                               generation_mode=getattr(self.adapter, 'provider', 'custom'))
-        except Exception:
+                self.last_diagnostics['fallback_used'] = False
+        except Exception as error:
             # Transport/configuration/response errors must never disclose credentials or bodies.
             result['provider_failed'] = True
+            self.last_diagnostics['succeeded'] = False
+            if self.last_diagnostics['error_category'] is None:
+                if isinstance(error, httpx.TimeoutException):
+                    category = 'timeout'
+                elif isinstance(error, httpx.HTTPStatusError):
+                    self.last_diagnostics['http_status'] = error.response.status_code
+                    category = _http_error_category(error.response.status_code)
+                else:
+                    category = 'service'
+                self.last_diagnostics['error_category'] = category
+        if isinstance(self.adapter, (HTTPGenerationAdapter, SpyLLMRecorder)):
+            diagnostic = self.adapter.last_diagnostics
+            if diagnostic is not None:
+                fallback_used = self.last_diagnostics['fallback_used']
+                self.last_diagnostics = dict(diagnostic)
+                self.last_diagnostics['fallback_used'] = fallback_used
         return result
 
 

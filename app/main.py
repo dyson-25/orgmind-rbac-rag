@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.accounts import account_errors, register_accounts
 from app.auth import Auth
 from app.config import Settings
 from app.database import Database
@@ -15,8 +16,9 @@ from app.http_limits import UploadBodyLimit
 from app.llm_service import LLMService
 from app.pdf_corpus import generate_corpus
 from app.rag_engine import RagEngine
-from app.rbac_guard import DENIAL, PERSONAS, ROLE_SCOPES, SCOPES, authorized_chunk_ids, authorized_scopes, validate_citations
+from app.rbac_guard import DENIAL, PERSONAS, ROLE_SCOPES, SCOPES, authorized_chunk_ids, authorized_document_ids, authorized_scopes, validate_citations
 from app.sql_analytics import SQLAnalytics
+from app.workspace import recover_workspace, register_workspace
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,8 +28,8 @@ class StrictModel(BaseModel):
 
 
 class Login(StrictModel):
-    username: str = Field(min_length=1, max_length=100)
-    password: str = Field(min_length=1, max_length=256)
+    username: str = Field(min_length=1, max_length=254)
+    password: str = Field(min_length=1, max_length=256, repr=False)
 
 
 class Persona(StrictModel):
@@ -63,6 +65,7 @@ def create_app(settings=None, llm=None):
         specs = generate_corpus(settings.data_dir / 'corpus')
         db.seed_documents(specs)
         rag.index_seeded(specs)
+        recover_workspace(db, rag)
         application.state.auth = Auth(db, settings)
         application.state.ready = True
         yield
@@ -79,7 +82,7 @@ def create_app(settings=None, llm=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'no-referrer'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
         if request.url.path.startswith('/api/'):
             response.headers['Cache-Control'] = 'no-store'
         return response
@@ -98,6 +101,9 @@ def create_app(settings=None, llm=None):
                 db.audit(user, 'admin-access', 'deny', rule='admin-only')
                 raise HTTPException(403, 'Administrator access required')
             yield user
+
+    register_accounts(app, db, identity, bearer)
+    register_workspace(app, db, rag, identity, bearer)
 
     def answer(query, user):
         chunks = rag.retrieve(query, user)
@@ -121,9 +127,25 @@ def create_app(settings=None, llm=None):
         db.audit(user, 'chat', 'deny' if denied else 'allow',
                  intercept=result.get('injection_warning', False) or denied, blocked=blocked,
                  rule='candidate-scope-exclusion' if denied else 'authorized-context')
-        if result.pop('provider_failed', False):
+        failed = result.pop('provider_failed', False)
+        diagnostics = getattr(app.state.llm, 'last_diagnostics', None)
+        if failed:
             db.audit(user, 'provider', 'fallback', rule='provider-unavailable')
-        return {**result, 'acl_epoch': db.epoch()}
+        elif diagnostics and diagnostics.get('succeeded'):
+            db.audit(user, 'provider', 'success', rule='authorized-context')
+        return {**result, 'acl_epoch': db.epoch(), 'provider_status': diagnostics}
+
+    @app.get('/api/admin/provider-status')
+    def provider_status(token=Depends(bearer)):
+        with identity(token, admin=True):
+            with db.connect() as conn:
+                counts = {row['decision']: row['total'] for row in conn.execute(
+                    "SELECT decision, COUNT(*) total FROM audit_logs WHERE action='provider' GROUP BY decision"
+                )}
+            return {'last_generation': getattr(app.state.llm, 'last_diagnostics', None),
+                    'successful_generations': counts.get('success', 0),
+                    'fallback_generations': counts.get('fallback', 0),
+                    'note': 'Last generation is process-local; counts are recorded requests, not a live provider probe.'}
 
     @app.get('/api/health')
     def health():
@@ -180,10 +202,12 @@ def create_app(settings=None, llm=None):
     @app.get('/api/documents')
     def documents(token=Depends(bearer)):
         with identity(token) as user, db.connect() as conn:
-            scopes = authorized_scopes(user)
+            allowed = authorized_document_ids(conn, user)
+            if not allowed:
+                return {'documents': []}
             rows = conn.execute('SELECT d.*, (SELECT count(*) FROM chunks c WHERE c.document_id=d.id) AS chunks '
-                'FROM documents d WHERE EXISTS (SELECT 1 FROM document_scopes s WHERE s.document_id=d.id '
-                f'AND s.scope IN ({",".join("?" for _ in scopes)})) ORDER BY d.id', scopes).fetchall()
+                f'FROM documents d WHERE d.id IN ({",".join("?" for _ in allowed)}) ORDER BY d.id',
+                sorted(allowed)).fetchall()
             result = []
             for row in rows:
                 result.append({k: row[k] for k in ('id', 'title', 'pages', 'chunks')})
@@ -250,7 +274,8 @@ def create_app(settings=None, llm=None):
         with identity(token, admin=True) as user:
             if uid not in PERSONAS or body.role not in ROLE_SCOPES:
                 raise HTTPException(400, 'Invalid demo identity or role')
-            db.change_role(uid, body.role)
+            with account_errors():
+                db.update_account(uid, {'role': body.role})
             db.audit(user, 'user-role', 'allow', rule='admin-synthetic-identity')
             return {'acl_epoch': db.epoch()}
 

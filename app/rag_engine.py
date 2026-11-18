@@ -113,7 +113,7 @@ class RagEngine:
         with self.db.lock:
             with self.db.connect() as conn:
                 conn.execute('DELETE FROM chunks WHERE document_id=?', (doc_id,))
-                conn.execute('INSERT INTO documents VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET '
+                conn.execute('INSERT INTO documents(id,title,filename,pages,metadata,digest) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET '
                              'title=excluded.title,filename=excluded.filename,pages=excluded.pages,metadata=excluded.metadata,digest=excluded.digest',
                              (doc_id, title[:200], Path(filename).name[:200], len(pages), json.dumps(metadata), digest))
                 conn.execute('DELETE FROM document_scopes WHERE document_id=?', (doc_id,))
@@ -142,7 +142,7 @@ class RagEngine:
                 self.db.bump_epoch(conn)
             self.rebuild()
 
-    def retrieve(self, query, user, mode='hybrid', limit=5):
+    def retrieve(self, query, user, mode='hybrid', limit=5, *, document_ids=None, exclude_fixtures=False):
         if mode not in {'bm25', 'lsa', 'hybrid'}:
             raise ValueError('Invalid retrieval mode')
         terms = query_terms(query)
@@ -152,6 +152,13 @@ class RagEngine:
             if self.index_epoch != self.db.epoch(conn):
                 self.rebuild()
             allowed = authorized_chunk_ids(conn, user)
+            if document_ids is not None or exclude_fixtures:
+                selected = None if document_ids is None else set(document_ids)
+                allowed.intersection_update(
+                    row['id'] for row in self.rows
+                    if (selected is None or row['document_id'] in selected)
+                    and (not exclude_fixtures or row['document_id'] != 'DOC_09')
+                )
             if not allowed:
                 return []
             sparse_ids, dense_ids = [], []
