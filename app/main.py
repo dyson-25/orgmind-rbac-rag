@@ -1,80 +1,96 @@
-import json
-from contextlib import asynccontextmanager, contextmanager
+import hashlib
+import secrets
+import threading
+import time
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, Response
+import pymupdf
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
-from app.accounts import account_errors, register_accounts
-from app.auth import Auth
 from app.config import Settings
 from app.database import Database
-from app.evaluator import evaluate
-from app.http_limits import UploadBodyLimit
-from app.llm_service import LLMService
-from app.pdf_corpus import generate_corpus
+from app.http_limits import RequestBodyLimit
+from app.llm_service import GenerationError, GenerationService, compose_retrieval_query
 from app.rag_engine import RagEngine
-from app.rbac_guard import DENIAL, PERSONAS, ROLE_SCOPES, SCOPES, authorized_chunk_ids, authorized_document_ids, authorized_scopes, validate_citations
-from app.sql_analytics import SQLAnalytics
-from app.workspace import recover_workspace, register_workspace
 
 ROOT = Path(__file__).resolve().parent.parent
+SAMPLE = ROOT / 'samples' / 'personal-finance-guide.pdf'
+COOKIE = 'orgmind_session'
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
 
-class Login(StrictModel):
-    username: str = Field(min_length=1, max_length=254)
-    password: str = Field(min_length=1, max_length=256, repr=False)
-
-
-class Persona(StrictModel):
-    persona_id: str = Field(min_length=1, max_length=100)
-
-
 class Chat(StrictModel):
-    query: str = Field(min_length=2, max_length=2000)
+    query: str = Field(min_length=1, max_length=4000)
+    document_ids: list[str] | None = Field(default=None, max_length=100)
+    conversation_id: str | None = Field(default=None, max_length=80)
 
 
-class Metric(StrictModel):
-    metric_id: str = Field(min_length=1, max_length=80)
-    period: str | None = Field(default=None, max_length=40)
+class Clear(StrictModel):
+    conversation_id: str | None = Field(default=None, max_length=80)
 
 
-class Permissions(StrictModel):
-    allowed_scopes: list[str] = Field(min_length=1, max_length=5)
+class Sessions:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.attempts = OrderedDict()
+        self.chats = OrderedDict()
+
+    def limit(self, key, count):
+        with self.lock:
+            now = time.monotonic()
+            while self.attempts and next(iter(self.attempts.values()))[-1] <= now - 60:
+                self.attempts.popitem(last=False)
+            queue = self.attempts.get(key)
+            if queue is None:
+                if len(self.attempts) >= 4096:
+                    raise HTTPException(429, 'The service is busy. Please try again in a minute.', headers={'Retry-After': '60'})
+                queue = deque()
+            while queue and queue[0] <= now - 60:
+                queue.popleft()
+            if len(queue) >= count:
+                raise HTTPException(429, 'Too many requests. Please wait a minute and try again.', headers={'Retry-After': '60'})
+            queue.append(now)
+            self.attempts[key] = queue
+            self.attempts.move_to_end(key)
 
 
-class Role(StrictModel):
-    role: str = Field(min_length=1, max_length=30)
-
-
-def create_app(settings=None, llm=None):
+def create_app(settings=None, generator=None):
     settings = settings or Settings()
     db = Database(settings)
     rag = RagEngine(db, settings)
-    generator = llm or LLMService()
+    generation = generator or GenerationService(settings)
+    sessions = Sessions()
 
     @asynccontextmanager
     async def lifespan(application):
         db.initialize()
-        specs = generate_corpus(settings.data_dir / 'corpus')
-        db.seed_documents(specs)
-        rag.index_seeded(specs)
-        recover_workspace(db, rag)
-        application.state.auth = Auth(db, settings)
+        rag.recover()
+        rag.rebuild()
         application.state.ready = True
         yield
         application.state.ready = False
+        with sessions.lock:
+            sessions.chats.clear()
+            sessions.attempts.clear()
 
-    app = FastAPI(title='OrgMind · Synthetic Enterprise Studio', lifespan=lifespan)
-    app.add_middleware(UploadBodyLimit, max_bytes=settings.max_upload_bytes)
-    app.state.db, app.state.rag, app.state.llm = db, rag, generator
-    app.state.settings, app.state.ready = settings, False
+    app = FastAPI(title='OrgMind · PDF Knowledge Assistant', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(RequestBodyLimit, max_bytes=settings.max_upload_bytes)
+    app.state.db, app.state.rag, app.state.generator = db, rag, generation
+    app.state.settings, app.state.ready, app.state.sessions = settings, False, sessions
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        return JSONResponse({'detail': 'Invalid request. Check the required fields and input limits.'}, status_code=422)
 
     @app.middleware('http')
     async def headers(request, call_next):
@@ -82,218 +98,188 @@ def create_app(settings=None, llm=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'no-referrer'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-        if request.url.path.startswith('/api/'):
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        if request.url.path == '/' or request.url.path.startswith(('/api/', '/static/')):
             response.headers['Cache-Control'] = 'no-store'
+        if getattr(request.state, 'session_token', None):
+            response.set_cookie(COOKIE, request.state.session_token,
+                                max_age=settings.session_ttl_days * 86400, httponly=True,
+                                secure=settings.environment == 'production', samesite='strict')
         return response
 
-    def bearer(authorization: str | None = Header(default=None)):
-        if not authorization or not authorization.startswith('Bearer '):
-            raise HTTPException(401, 'Authentication required')
-        return authorization[7:]
+    def mutation(request):
+        if request.method not in {'GET', 'HEAD'}:
+            if request.headers.get('X-OrgMind-Request') != '1':
+                raise HTTPException(403, 'Use the application to submit this request.')
+            origin = request.headers.get('origin')
+            if origin and origin != str(request.base_url).rstrip('/'):
+                raise HTTPException(403, 'Cross-origin requests are not allowed.')
 
-    @contextmanager
-    def identity(token, admin=False):
-        # Serialize authorization, context assembly and lifecycle writes in the single worker.
-        with db.lock:
-            user = app.state.auth.verify(token)
-            if admin and user['role'] != 'admin':
-                db.audit(user, 'admin-access', 'deny', rule='admin-only')
-                raise HTTPException(403, 'Administrator access required')
-            yield user
+    def access(request: Request):
+        mutation(request)
+        token = request.cookies.get(COOKIE)
+        ttl = settings.session_ttl_days * 86400
+        owner_id = db.resolve_session(token, ttl)
+        if owner_id is None:
+            peer = request.client.host if request.client else 'unknown'
+            sessions.limit(('session-issue', peer), 10)
+            try:
+                token = db.create_session(ttl)
+            except ValueError:
+                raise HTTPException(503, 'Workspace capacity reached. Please try later.') from None
+            owner_id = db.resolve_session(token, ttl)
+            if owner_id is None:
+                raise HTTPException(503, 'Unable to open a workspace. Please try again.')
+        request.state.session_token = token
+        return owner_id
 
-    register_accounts(app, db, identity, bearer)
-    register_workspace(app, db, rag, identity, bearer)
+    def limited(request, kind, owner_id):
+        peer = request.client.host if request.client else 'unknown'
+        if kind == 'upload':
+            sessions.limit(('upload-ip', peer), settings.ip_upload_requests_per_minute)
+            sessions.limit(('upload-session', owner_id), settings.upload_requests_per_minute)
+        else:
+            sessions.limit(('generation-global',), settings.global_requests_per_minute)
+            sessions.limit(('generation-ip', peer), settings.requests_per_minute)
+            sessions.limit(('generation-session', owner_id), settings.requests_per_minute)
 
-    def answer(query, user):
-        chunks = rag.retrieve(query, user)
-        result = app.state.llm.generate(query, chunks)
-        with db.connect() as conn:
-            allowed = authorized_chunk_ids(conn, user)
-            validate_citations(result['citations'], allowed)
-            # Also validate cited document/page provenance, not merely the chunk ID.
-            lookup = {r['id']: r for r in chunks}
-            for citation in result['citations']:
-                source = lookup.get(citation['chunk_id'])
-                if not source or any(citation[k] != source[k] for k in ('document_id', 'page', 'title')):
-                    raise HTTPException(500, 'Evidence validation failed')
-            denied = result['answer'] == DENIAL
-            blocked = []
-            if denied:
-                scopes = authorized_scopes(user)
-                blocked = [r[0] for r in conn.execute('SELECT id FROM documents d WHERE NOT EXISTS '
-                    '(SELECT 1 FROM document_scopes s WHERE s.document_id=d.id '
-                    f'AND s.scope IN ({",".join("?" for _ in scopes)}))', scopes)]
-        db.audit(user, 'chat', 'deny' if denied else 'allow',
-                 intercept=result.get('injection_warning', False) or denied, blocked=blocked,
-                 rule='candidate-scope-exclusion' if denied else 'authorized-context')
-        failed = result.pop('provider_failed', False)
-        diagnostics = getattr(app.state.llm, 'last_diagnostics', None)
-        if failed:
-            db.audit(user, 'provider', 'fallback', rule='provider-unavailable')
-        elif diagnostics and diagnostics.get('succeeded'):
-            db.audit(user, 'provider', 'success', rule='authorized-context')
-        return {**result, 'acl_epoch': db.epoch(), 'provider_status': diagnostics}
-
-    @app.get('/api/admin/provider-status')
-    def provider_status(token=Depends(bearer)):
-        with identity(token, admin=True):
-            with db.connect() as conn:
-                counts = {row['decision']: row['total'] for row in conn.execute(
-                    "SELECT decision, COUNT(*) total FROM audit_logs WHERE action='provider' GROUP BY decision"
-                )}
-            return {'last_generation': getattr(app.state.llm, 'last_diagnostics', None),
-                    'successful_generations': counts.get('success', 0),
-                    'fallback_generations': counts.get('fallback', 0),
-                    'note': 'Last generation is process-local; counts are recorded requests, not a live provider probe.'}
+    def document(doc):
+        return {key: doc[key] for key in ('id', 'filename', 'pages', 'status', 'uploaded_at')} | {
+            'is_sample': doc.get('digest') == hashlib.sha256(SAMPLE.read_bytes()).hexdigest()
+        }
 
     @app.get('/api/health')
     def health():
-        return {'status': 'ok' if app.state.ready else 'starting', 'synthetic_data': True}
+        if not app.state.ready:
+            raise HTTPException(503, 'Starting up')
+        return {'status': 'ok'}
 
     @app.get('/api/config')
-    def config():
-        return {'demo_enabled': settings.allow_demo, 'personas': PERSONAS if settings.allow_demo else {},
-                'scopes': SCOPES, 'synthetic_data': True}
-
-    @app.post('/api/auth/login')
-    def login(body: Login):
-        with db.lock:
-            return app.state.auth.login(body.username, body.password)
-
-    @app.post('/api/auth/demo-persona')
-    def demo(body: Persona):
-        with db.lock:
-            return app.state.auth.demo(body.persona_id)
-
-    @app.get('/api/auth/me')
-    def me(token=Depends(bearer)):
-        with identity(token) as user:
-            return app.state.auth.public(user)
-
-    @app.post('/api/chat')
-    def chat(body: Chat, token=Depends(bearer)):
-        with identity(token) as user:
-            return answer(body.query, user)
-
-    @app.post('/api/chat/compare-roles')
-    def compare(body: Chat, token=Depends(bearer)):
-        with identity(token, admin=True) as user:
-            results = []
-            for uid in ('finance_user', 'hr_user', 'eng_user', 'general_user', 'executive_user'):
-                persona = db.user(uid)
-                results.append({'persona_id': uid, 'role': persona['role'], **answer(body.query, persona)})
-            db.audit(user, 'compare-roles', 'allow', rule='admin-demo-comparison')
-            return {'results': results}
-
-    @app.post('/api/sql/query')
-    def sql_query(body: Metric, token=Depends(bearer)):
-        with identity(token) as user:
-            try:
-                result = SQLAnalytics(db).query(body.metric_id, user, body.period)
-            except PermissionError:
-                db.audit(user, 'analytics', 'deny', intercept=True, rule='metric-scope')
-                raise HTTPException(403, DENIAL) from None
-            except ValueError:
-                raise HTTPException(400, 'Unknown analytical metric or invalid parameters') from None
-            db.audit(user, 'analytics', 'allow', rule='approved-template')
-            return result
+    def config(token=Depends(access)):
+        return {'name': 'OrgMind', 'description': 'PDF Knowledge Assistant',
+                'session_ttl_days': settings.session_ttl_days,
+                'ephemeral_storage': settings.ephemeral_storage, 'max_upload_bytes': settings.max_upload_bytes,
+                'max_query_chars': settings.max_query_chars,
+                'generation_available': settings.generation_provider == 'openai' and bool(settings.openai_api_key)}
 
     @app.get('/api/documents')
-    def documents(token=Depends(bearer)):
-        with identity(token) as user, db.connect() as conn:
-            allowed = authorized_document_ids(conn, user)
-            if not allowed:
-                return {'documents': []}
-            rows = conn.execute('SELECT d.*, (SELECT count(*) FROM chunks c WHERE c.document_id=d.id) AS chunks '
-                f'FROM documents d WHERE d.id IN ({",".join("?" for _ in allowed)}) ORDER BY d.id',
-                sorted(allowed)).fetchall()
-            result = []
-            for row in rows:
-                result.append({k: row[k] for k in ('id', 'title', 'pages', 'chunks')})
-                result[-1]['allowed_scopes'] = [r[0] for r in conn.execute(
-                    'SELECT scope FROM document_scopes WHERE document_id=? ORDER BY scope', (row['id'],))]
-            return {'documents': result}
+    def documents(token=Depends(access)):
+        with db.lock:
+            return {'documents': [document(doc) for doc in db.list_documents(owner_id=token)]}
 
-    @app.get('/api/documents/{doc_id}/chunks/{chunk_id}')
-    def citation(doc_id: str, chunk_id: str, token=Depends(bearer)):
-        with identity(token) as user, db.connect() as conn:
-            if chunk_id not in authorized_chunk_ids(conn, user):
-                raise HTTPException(404, 'Evidence unavailable')
-            row = conn.execute('SELECT c.*,d.title FROM chunks c JOIN documents d ON d.id=c.document_id '
-                               'WHERE c.id=? AND c.document_id=?', (chunk_id, doc_id)).fetchone()
-            if not row:
-                raise HTTPException(404, 'Evidence unavailable')
-            return dict(row)
-
-    @app.post('/api/documents/upload', status_code=201)
-    async def upload(file: UploadFile = File(...), allowed_scopes: str = Form(...), token=Depends(bearer)):
-        with identity(token, admin=True):
-            pass
-        if file.content_type != 'application/pdf':
-            await file.close()
-            raise HTTPException(400, 'Only application/pdf is accepted')
-        raw = await file.read(settings.max_upload_bytes + 1)
-        filename = file.filename or 'upload.pdf'
-        await file.close()
+    def ingest(raw, filename, owner_id):
         try:
-            scopes = json.loads(allowed_scopes)
-            if not isinstance(scopes, list) or not all(isinstance(s, str) for s in scopes):
-                raise ValueError('Invalid scopes')
-            with identity(token, admin=True) as user:
-                doc_id = rag.ingest(raw, Path(filename).stem, filename, scopes)
-                db.audit(user, 'document-upload', 'allow', rule='admin-synthetic-lifecycle')
-                return {'document_id': doc_id, 'acl_epoch': db.epoch()}
-        except (ValueError, TypeError):
-            raise HTTPException(400, 'Invalid PDF or scopes; check file and size limits') from None
+            with db.lock:
+                return document(rag.ingest(raw, filename, owner_id=owner_id))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except OSError:
+            raise HTTPException(503, 'Unable to save the PDF. Check available storage.') from None
 
-    @app.patch('/api/documents/{doc_id}/permissions')
-    def permissions(doc_id: str, body: Permissions, token=Depends(bearer)):
-        with identity(token, admin=True) as user:
+    @app.post('/api/documents/upload')
+    async def upload(request: Request, file: UploadFile = File(...), token=Depends(access)):
+        limited(request, 'upload', token)
+        try:
+            raw = await file.read(settings.max_upload_bytes + 1)
+            if len(raw) > settings.max_upload_bytes:
+                raise HTTPException(413, 'PDF exceeds the upload limit.')
+            return await run_in_threadpool(ingest, raw, file.filename or '', token)
+        finally:
+            await file.close()
+
+    @app.post('/api/documents/sample')
+    def sample(request: Request, token=Depends(access)):
+        limited(request, 'upload', token)
+        return ingest(SAMPLE.read_bytes(), SAMPLE.name, token)
+
+    @app.delete('/api/documents/{doc_id}')
+    def delete(doc_id: str, token=Depends(access)):
+        with db.lock:
             try:
-                rag.permissions(doc_id, body.allowed_scopes)
-            except ValueError:
-                raise HTTPException(400, 'Invalid scopes') from None
+                rag.delete(doc_id, owner_id=token)
             except KeyError:
-                raise HTTPException(404, 'Document not found') from None
-            db.audit(user, 'document-permissions', 'allow', rule='admin-synthetic-lifecycle')
-            return {'acl_epoch': db.epoch()}
+                raise HTTPException(404, 'Document not found.') from None
+            with sessions.lock:
+                sessions.chats.pop(token, None)
+        return {'deleted': True}
 
-    @app.delete('/api/documents/{doc_id}', status_code=204)
-    def delete(doc_id: str, token=Depends(bearer)):
-        with identity(token, admin=True) as user:
+    @app.get('/api/documents/{doc_id}/sources/{chunk_id}')
+    def source(doc_id: str, chunk_id: str, token=Depends(access)):
+        with db.lock:
             try:
-                rag.delete(doc_id)
+                row = db.get_chunk(doc_id, chunk_id, owner_id=token)
+                doc = db.get_document(doc_id, owner_id=token)
             except KeyError:
-                raise HTTPException(404, 'Document not found') from None
-            db.audit(user, 'document-delete', 'allow', rule='admin-synthetic-lifecycle')
-            return Response(status_code=204)
+                raise HTTPException(404, 'Source not found.') from None
+            return {'document_id': doc_id, 'chunk_id': row['id'], 'filename': doc['filename'], 'page': row['page'], 'text': row['text']}
 
-    @app.patch('/api/admin/users/{uid}/role')
-    def role(uid: str, body: Role, token=Depends(bearer)):
-        with identity(token, admin=True) as user:
-            if uid not in PERSONAS or body.role not in ROLE_SCOPES:
-                raise HTTPException(400, 'Invalid demo identity or role')
-            with account_errors():
-                db.update_account(uid, {'role': body.role})
-            db.audit(user, 'user-role', 'allow', rule='admin-synthetic-identity')
-            return {'acl_epoch': db.epoch()}
+    @app.get('/api/documents/{doc_id}/preview')
+    def preview(doc_id: str, page: int = Query(default=1, ge=1, le=100), token=Depends(access)):
+        with db.lock:
+            try:
+                path = db.original_path(doc_id, owner_id=token)
+                with pymupdf.open(path) as pdf:
+                    if page > len(pdf):
+                        raise HTTPException(404, 'Page not found.')
+                    source_page = pdf[page - 1]
+                    scale = min(1.5, 1200 / max(source_page.rect.width, source_page.rect.height, 1))
+                    image = source_page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes('png')
+            except (KeyError, FileNotFoundError):
+                raise HTTPException(404, 'Original PDF is unavailable.') from None
+            except (RuntimeError, ValueError):
+                raise HTTPException(400, 'Unable to preview this PDF.') from None
+        return Response(image, media_type='image/png')
 
-    @app.get('/api/admin/audit-logs')
-    def audit_logs(limit: int = Query(default=50, ge=1, le=100), token=Depends(bearer)):
-        with identity(token, admin=True), db.connect() as conn:
-            return {'logs': [dict(r) for r in conn.execute('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?', (limit,))],
-                    'integrity_valid': db.verify_audit()}
+    @app.post('/api/chat')
+    def chat(payload: Chat, request: Request, token=Depends(access)):
+        query = payload.query.strip()
+        if not query or len(query) > settings.max_query_chars:
+            raise HTTPException(422, 'Question is empty or exceeds the query limit.')
+        limited(request, 'generation', token)
+        with db.lock:
+            selected = list(dict.fromkeys(payload.document_ids)) if payload.document_ids is not None else None
+            if selected == []:
+                raise HTTPException(400, 'Select at least one document.')
+            if selected:
+                try:
+                    for did in selected:
+                        if db.get_document(did, owner_id=token)['status'] != 'indexed':
+                            raise HTTPException(400, 'Selected document is not indexed.')
+                except KeyError:
+                    raise HTTPException(404, 'Selected document no longer exists.') from None
+            with sessions.lock:
+                conversations = sessions.chats.setdefault(token, OrderedDict())
+                sessions.chats.move_to_end(token)
+                while len(sessions.chats) > 256:
+                    sessions.chats.popitem(last=False)
+                cid = payload.conversation_id or secrets.token_urlsafe(18)
+                existing = conversations.get(cid)
+                if payload.conversation_id and existing is None:
+                    raise HTTPException(404, 'Conversation expired. Clear the conversation and try again.')
+                history = existing['messages'] if existing and existing['documents'] == selected else []
+            chunks = rag.retrieve(compose_retrieval_query(query, history, max_query_chars=settings.max_query_chars), document_ids=selected, limit=5, owner_id=token)
+            try:
+                result = app.state.generator.answer(query, chunks, history=history)
+            except GenerationError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from None
+            with sessions.lock:
+                messages = history + [{'role': 'user', 'content': query}, {'role': 'assistant', 'content': result['answer'][:8000]}]
+                conversations[cid] = {'documents': selected, 'messages': messages[-12:]}
+                while len(conversations) > 8:
+                    conversations.popitem(last=False)
+            return {**result, 'conversation_id': cid}
 
-    @app.get('/api/eval/benchmark')
-    def benchmark(token=Depends(bearer)):
-        with identity(token, admin=True) as user:
-            result = evaluate(rag, db)
-            db.audit(user, 'benchmark', 'allow', rule='admin-only')
-            return result
+    @app.post('/api/conversations/clear')
+    def clear(payload: Clear, token=Depends(access)):
+        with sessions.lock:
+            if payload.conversation_id:
+                sessions.chats.get(token, {}).pop(payload.conversation_id, None)
+            else:
+                sessions.chats.pop(token, None)
+        return {'cleared': True}
 
     @app.get('/')
-    def index():
+    def index(token=Depends(access)):
         return FileResponse(ROOT / 'static' / 'index.html')
 
     app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')

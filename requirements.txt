@@ -4,8 +4,6 @@ uvicorn==0.54.0
 PyMuPDF==1.28.2
 scikit-learn==1.9.1
 numpy==2.5.5
-PyJWT==2.15.1
-pwdlib[argon2]==0.4.2
 httpx==0.28.1
 httpx2==2.16.2
 pydantic==2.14.3

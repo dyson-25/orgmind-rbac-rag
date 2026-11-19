@@ -1,4 +1,4 @@
-# Only application source, bundled licensed assets, frontend, and dependencies enter the build.
+# Only application source, the optional sample, frontend, and dependencies enter the build.
 **
 !Dockerfile
 !.dockerignore
@@ -7,6 +7,8 @@
 !app/**
 !static/
 !static/**
+!samples/
+!samples/**
 
 **/__pycache__/
 **/*.py[cod]

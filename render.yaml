@@ -1,8 +1,5 @@
-
-# OrgMind production service
-# Credential-based sign-in; public role switching is disabled.
-# OpenRouter API key must be configured privately in the Render Dashboard.
-
+# Public, isolated anonymous workspaces; configure the provider key privately.
+# This blueprint does not create persistent storage.
 services:
   - type: web
     name: orgmind-demo
@@ -11,28 +8,20 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
-
     envVars:
       - key: APP_ENV
         value: production
-
-      - key: JWT_SECRET
-        generateValue: true
-
-      - key: ALLOW_DEMO_PERSONA
-        value: "false"
-
       - key: DATA_DIR
         value: /app/data
-
+      - key: EPHEMERAL_STORAGE
+        value: "true"
       - key: GENERATION_PROVIDER
         value: openai
-
       - key: OPENAI_BASE_URL
         value: https://openrouter.ai/api/v1
-
       - key: OPENAI_MODEL
         value: baidu/ernie-5.5-flash-preview:free
-
-      - key: EMBEDDING_PROVIDER
-        value: local
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GENERATION_TIMEOUT_SECONDS
+        value: "30"
