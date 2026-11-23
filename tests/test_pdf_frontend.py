@@ -38,7 +38,7 @@ def test_editorial_pdf_markup_and_accessibility():
     assert "sent to OpenRouter" in html
     for identifier in (
         "app-shell", "chat-panel", "pdf-files", "document-list", "chat-form",
-        "query", "source-dialog", "source-text", "source-image", "storage-notice",
+        "query", "source-dialog", "source-passages", "source-image", "storage-notice",
         "privacy-note", "session-notice",
     ):
         assert identifier in parser.ids
@@ -51,12 +51,18 @@ def test_editorial_pdf_markup_and_accessibility():
     assert not re.search(r"Acme|SQL|benchmark|dashboard|diagnostics|roles|username", html, re.I)
     assert all("aria-label" in attrs or "aria-labelledby" in attrs for tag, attrs in parser.tags if tag == "dialog")
     js = (STATIC / "app.js").read_text()
-    assert not re.search(r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|localStorage|sessionStorage", js)
+    assert not re.search(r"innerHTML|outerHTML|insertAdjacentHTML|document\.write", js)
     assert "credentials: 'same-origin'" in js
     assert "headers['X-OrgMind-Request'] = '1'" in js
     css = (STATIC / "styles.css").read_text()
     assert "@media (max-width: 720px)" in css
     assert "prefers-reduced-motion" in css
+    theme = (STATIC / "theme.js").read_text()
+    assert "orgmind-theme" in theme and "prefers-color-scheme: dark" in theme
+    assert "localStorage.setItem" in js
+    assert "discovery-suggestions" in parser.ids and "suggestion-list" in parser.ids
+    assert "START EXPLORING YOUR DOCUMENT" in html
+    assert "data-theme" in css and "dot-field" in js
     assert "forced-colors" in css
     assert "@import" not in css and "url(" not in css
     assert not re.search(r"password|authenticated|/api/unlock|/api/lock|login|registration", html + js + css, re.I)
@@ -110,9 +116,7 @@ for (const match of html.matchAll(/<([a-z][a-z0-9]*)\b([^>]*\bid="([^"]+)"[^>]*)
   el.className = /\bclass="([^"]*)"/.exec(match[2])?.[1] || '';
   elements.set(match[3], el);
 }
-const suggestions = [...html.matchAll(/class="suggestion"[^>]*data-query="([^"]*)"/g)].map(match => {
-  const el = new Element('button'); el.className = 'suggestion'; el.dataset.query = match[1]; return el;
-});
+const suggestions = [];
 const $ = id => elements.get(id);
 const descendants = el => [el, ...el.children.flatMap(descendants)];
 const all = () => [...elements.values()].flatMap(descendants).concat(suggestions);
@@ -130,7 +134,7 @@ const response = (data, status = 200, type = 'application/json') => ({
 });
 const fetch = async (path, options) => {
   calls.push({ path, ...options });
-  const handler = handlers.get(path);
+  const handler = handlers.get(path) || (path.startsWith('/api/suggestions?') ? handlers.get('/api/suggestions') : undefined);
   assert.ok(handler, 'Unexpected endpoint ' + path);
   return typeof handler === 'function' ? handler(options) : response(handler);
 };
@@ -139,6 +143,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 const config = { name: 'OrgMind', session_ttl_days: 30, ephemeral_storage: true,
   generation_available: true, max_upload_bytes: 10485760, max_query_chars: 2000 };
 handlers.set('/api/config', config);
+handlers.set('/api/suggestions', { suggestions: [] });
 handlers.set('/api/documents', { documents: [] });
 const bad = '<img src=x onerror="globalThis.executed=true">';
 const doc = { id: 'doc1', filename: bad + '.pdf', pages: 2, status: 'ready', is_sample: false };
@@ -146,7 +151,7 @@ const citation = { document_id: 'doc1', chunk_id: 'chunk1', filename: doc.filena
 class FormData { constructor() { this.values = []; } append(...args) { this.values.push(args); } }
 function boot() {
   vm.runInNewContext(fs.readFileSync('static/app.js', 'utf8'), {
-    document, window: { addEventListener() {} }, fetch, FormData, DOMException, AbortController,
+    document, window: { addEventListener() {} }, fetch, FormData, DOMException, AbortController, URLSearchParams,
     setTimeout, clearTimeout, URL: { createObjectURL: () => 'blob:test-' + ++blobNumber, revokeObjectURL: value => revoked.push(value) },
   });
 }
@@ -156,6 +161,29 @@ const findClass = name => document.querySelectorAll('.' + name);
 
 
 SCENARIOS = {
+    "citation_page_grouping": r"""
+const secondDoc = { ...doc, id: 'doc2', filename: doc.filename };
+handlers.set('/api/documents', { documents: [doc, secondDoc] });
+const citations = [citation, { ...citation, chunk_id: 'chunk2' },
+  { ...citation, chunk_id: 'chunk3', page: 2 }, { ...citation, document_id: 'doc2', chunk_id: 'chunk4' }];
+handlers.set('/api/chat', { answer: 'Grounded answer', citations, status: 'generated', conversation_id: 'c1' });
+for (const [id, text] of [['chunk1', 'First exact passage.'], ['chunk2', 'Second exact passage.'],
+  ['chunk3', 'A different page.'], ['chunk4', 'A different document.']]) {
+  handlers.set(`/api/documents/${id === 'chunk4' ? 'doc2' : 'doc1'}/sources/${id}`,
+    { text, filename: doc.filename, page: id === 'chunk3' ? 2 : 1 });
+}
+handlers.set('/api/documents/doc1/preview?page=1', () => response('one page image', 200, 'image/png'));
+boot(); await tick();
+await chatSubmit('What supports the answer?');
+assert.equal(findClass('citation').length, 3);
+assert.ok(findClass('citation').some(button => button.textContent.includes('2 supporting passages')));
+await findClass('citation')[0].emit('click');
+assert.ok($('source-passages').textContent.includes('First exact passage.'));
+assert.ok($('source-passages').textContent.includes('Second exact passage.'));
+assert.equal(calls.filter(call => call.path === '/api/documents/doc1/preview?page=1').length, 1);
+assert.deepEqual(calls.filter(call => call.path.includes('/sources/')).map(call => call.path),
+  ['/api/documents/doc1/sources/chunk1', '/api/documents/doc1/sources/chunk2']);
+""",
     "safe_sources_and_removal_races": r"""
 handlers.set('/api/documents', { documents: [doc] });
 handlers.set('/api/chat', { answer: bad, citations: [citation], status: 'generated', conversation_id: 'c1' });
@@ -168,13 +196,13 @@ assert.equal($('app-shell').classList.contains('is-empty'), false);
 assert.equal($('chat-panel').hidden, false);
 assert.equal($('storage-notice').hidden, false);
 assert.ok($('session-notice').textContent.includes('30 days'));
-assert.equal($('sample-suggestions').hidden, true);
+assert.equal($('discovery-suggestions').hidden, true);
 assert.ok($('document-list').textContent.includes(bad));
 await chatSubmit('What does this PDF say?');
 assert.ok($('chat-messages').textContent.includes(bad));
 assert.equal(findClass('citation').length, 1);
 await findClass('citation')[0].emit('click');
-assert.equal($('source-text').textContent, bad);
+assert.equal($('source-passages').textContent, 'Supporting passage 1' + bad);
 assert.equal($('source-image').src, 'blob:test-1');
 await $('close-source').emit('click');
 assert.deepEqual(revoked, ['blob:test-1']);
@@ -201,25 +229,26 @@ assert.ok(calls.filter(call => call.method !== 'GET').every(call => call.headers
 """,
     "sample_gating_and_provider_failure": r"""
 handlers.set('/api/documents/sample', { ...doc, is_sample: true });
+handlers.set('/api/suggestions', { suggestions: [{ question: 'What does this sample guide explain?', document_ids: ['doc1'] }] });
 handlers.set('/api/chat', () => response({ detail: 'Provider unavailable: ' + bad }, 503));
 handlers.set('/api/conversations/clear', { cleared: true });
 boot(); await tick();
-assert.equal($('sample-suggestions').hidden, true);
+assert.equal($('discovery-suggestions').hidden, true);
 assert.equal($('query').disabled, true);
 await $('load-sample').emit('click');
-assert.equal($('sample-suggestions').hidden, false);
+assert.equal($('discovery-suggestions').hidden, false);
 assert.equal($('load-sample').hidden, true);
 assert.equal($('query').disabled, false);
-await suggestions[0].emit('click');
+await findClass('suggestion')[0].emit('click');
 assert.ok($('chat-messages').textContent.includes('No answer was generated.'));
 assert.ok($('chat-messages').textContent.includes(bad));
-assert.ok($('query').value.includes('50/30/20'));
+assert.ok($('query').value.includes('What does this sample guide explain?'));
 assert.equal(findClass('citation').length, 0);
 assert.equal(findClass('assistant').length, 0);
 await $('clear-conversation').emit('click');
 assert.equal($('chat-messages').children.length, 0);
 const check = findClass('document-check')[0]; check.checked = false; await check.emit('change');
-assert.equal($('sample-suggestions').hidden, true);
+assert.equal($('discovery-suggestions').hidden, true);
 assert.equal($('query').disabled, true);
 assert.equal(findClass('document-check')[0].focused, true);
 """,
@@ -259,6 +288,7 @@ await $('pdf-files').emit('change');
 assert.equal(maximum, 1);
 assert.equal(count, 2);
 assert.equal($('document-count').textContent, '2');
+assert.ok($('upload-status').textContent.startsWith('2 PDFs in your library.'));
 assert.ok($('upload-status').textContent.includes('not-pdf.txt: choose a PDF file.'));
 await chatSubmit('Question');
 assert.deepEqual(JSON.parse(calls.find(call => call.path === '/api/chat').body).document_ids, ['upload1', 'upload2']);
@@ -276,6 +306,7 @@ assert.equal($('pdf-files').disabled, false);
 assert.equal($('generation-notice').hidden, false);
 assert.ok($('session-notice').textContent.includes('does not prove identity'));
 handlers.set('/api/documents/sample', { ...doc, is_sample: true });
+handlers.set('/api/suggestions', { suggestions: [{ question: 'What does this sample guide explain?', document_ids: ['doc1'] }] });
 await $('load-sample').emit('click');
 assert.equal($('app-shell').classList.contains('is-empty'), false);
 assert.equal($('chat-panel').hidden, false);
@@ -333,6 +364,7 @@ assert.equal($('chat-panel').hidden, true);
 assert.equal($('query').disabled, true);
 assert.ok($('global-status').textContent.includes('expired'));
 handlers.set('/api/documents/sample', { ...doc, is_sample: true });
+handlers.set('/api/suggestions', { suggestions: [{ question: 'What does this sample guide explain?', document_ids: ['doc1'] }] });
 await $('load-sample').emit('click');
 handlers.set('/api/documents/doc1', () => response({ detail: 'Document unavailable' }, 404));
 await findClass('remove-document')[0].emit('click');
@@ -380,13 +412,13 @@ handlers.set('/api/documents/doc1/sources/chunk1', { text: 'Evidence remains rea
 handlers.set('/api/documents/doc1/preview?page=1', () => response('html', 200, 'text/html'));
 boot(); await tick(); await chatSubmit('Question');
 await findClass('citation')[0].emit('click');
-assert.equal($('source-text').textContent, 'Evidence remains readable');
+assert.equal($('source-passages').textContent, 'Supporting passage 1Evidence remains readable');
 assert.equal($('source-image').hidden, true);
 assert.ok($('preview-status').textContent.includes('Preview unavailable'));
 assert.equal(blobNumber, 0);
 await $('source-dialog').emit('cancel');
 assert.equal($('source-dialog').open, false);
-assert.equal($('source-text').textContent, '');
+assert.equal($('source-passages').textContent, '');
 handlers.set('/api/documents/doc1/sources/chunk1', () => response({ detail: 'This source has expired.' }, 404));
 await findClass('citation')[0].emit('click');
 assert.ok($('source-status').textContent.includes('expired'));
@@ -401,7 +433,7 @@ boot(); await tick(); await chatSubmit('Question');
 await findClass('citation')[0].emit('click');
 await $('close-source').emit('click');
 pending.resolve(response({ text: 'STALE SOURCE', filename: doc.filename, page: 1 })); await tick();
-assert.equal($('source-text').textContent, '');
+assert.equal($('source-passages').textContent, '');
 assert.equal(calls.some(call => call.path.includes('/preview')), false);
 """,
 }

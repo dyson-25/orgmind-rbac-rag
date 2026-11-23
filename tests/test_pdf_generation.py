@@ -115,6 +115,71 @@ def test_only_retrieval_fields_enter_prompt(settings, chunks):
     assert b'DO NOT TRANSMIT' not in requests[0].content
 
 
+def test_intent_instructions_are_concise_and_document_scoped(settings, chunks):
+    _, requests = call(settings, chunks, completion(), question='Explain this document to a beginner.')
+    payload = json.loads(requests[0].content)
+    assert json.loads(payload['messages'][1]['content'])['intent'] == 'overview'
+    assert 'beginner' in payload['messages'][0]['content'].lower()
+    chunks[1]['document_id'] = 'another-selected-pdf'
+    chunks[1]['filename'] = 'Solar.pdf'
+    _, requests = call(settings, chunks, completion(), question='Explain this document to a beginner.')
+    payload = json.loads(requests[0].content)
+    assert json.loads(payload['messages'][1]['content'])['intent'] == 'multi_document_overview'
+    assert 'never transfer facts between documents' in payload['messages'][0]['content'].lower()
+
+
+def test_selected_document_overview_includes_every_retrieved_filename(settings, chunks):
+    chunks[1]['document_id'] = 'second-selected-pdf'
+    chunks[1]['filename'] = 'Solar Energy.pdf'
+    _, requests = call(settings, chunks, completion(ids=['q1', 'q2']),
+                       question='Explain the selected documents separately.')
+    payload = json.loads(requests[0].content)
+    prompt_data = json.loads(payload['messages'][1]['content'])
+    assert prompt_data['intent'] == 'multi_document_overview'
+    assert {source['filename'] for source in prompt_data['retrieved_sources']} == {'Finance.pdf', 'Solar Energy.pdf'}
+    assert 'exact filename for every source document' in payload['messages'][0]['content']
+    assert 'Never state that only one document is selected' in payload['messages'][0]['content']
+
+
+def test_length_finish_gets_one_bounded_concise_retry(settings, chunks):
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        body = completion('Concise supported answer.', ['q1'])
+        if len(requests) == 1:
+            body['choices'][0]['finish_reason'] = 'length'
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = GenerationService(settings, client).answer('Explain this document to a beginner.', chunks)
+    assert result['answer'] == 'Concise supported answer.'
+    assert len(requests) == 2
+    assert requests[0]['max_tokens'] == requests[1]['max_tokens'] == settings.generation_max_tokens
+    first = json.loads(requests[0]['messages'][1]['content'])
+    retry = json.loads(requests[1]['messages'][1]['content'])
+    assert len(retry['retrieved_sources']) < len(first['retrieved_sources'])
+    assert 'at most 90 words' in requests[1]['messages'][0]['content']
+
+
+def test_repeated_truncation_stops_after_one_retry(settings, chunks):
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        body = completion()
+        body['choices'][0]['finish_reason'] = 'length'
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError) as failure:
+            GenerationService(settings, client).answer('Explain this document.', chunks)
+    assert calls == 2
+    assert failure.value.category == 'truncation'
+    assert 'partial' not in str(failure.value).lower()
+
+
 @pytest.mark.parametrize('provider,key', [('local', ''), ('openai', '')])
 def test_unconfigured_or_disabled_never_pretends_ai_success(settings, chunks, provider, key):
     settings.generation_provider = provider
@@ -226,6 +291,11 @@ def test_provider_errors_are_sanitized_without_retries(settings, chunks, status,
             GenerationService(settings, client).answer('Revenue?', chunks)
     assert failure.value.category == category
     assert failure.value.status_code == api_status
+    if status == 429:
+        assert str(failure.value) == 'Answer generation is temporarily busy. Your documents are safe. Please try again shortly.'
+        assert failure.value.retry_after == 3600
+    else:
+        assert failure.value.retry_after is None
     assert len(requests) == 1
     assert 'raw secret' not in str(failure.value)
     assert settings.openai_api_key not in str(failure.value)
@@ -322,6 +392,20 @@ def test_duplicate_source_ids_are_rejected(settings, chunks):
     with pytest.raises(GenerationError) as failure:
         GenerationService(settings).answer('Revenue?', chunks)
     assert failure.value.category == 'invalid_sources'
+
+
+@pytest.mark.parametrize('leak', [
+    'Internal source [0123456789abcdef0123456789abcdef] supports this.',
+    'Internal source [575e1eefa1b...] supports this.',
+    'citation_ids: ["q1"]',
+    '{"answer": "value", "retrieved_sources": []}',
+])
+def test_internal_identifiers_and_generation_metadata_never_reach_answers(settings, chunks, leak):
+    chunks[0]['id'] = '0123456789abcdef0123456789abcdef'
+    with pytest.raises(GenerationError) as failure:
+        call(settings, chunks, completion(leak, [chunks[0]['id']]))
+    assert failure.value.category == 'invalid_response'
+    assert chunks[0]['id'] not in str(failure.value)
 
 
 @pytest.mark.parametrize('finish_reason,refusal,category', [

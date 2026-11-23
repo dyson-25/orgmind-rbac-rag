@@ -19,6 +19,19 @@ def make_pdf(text):
         return pdf.tobytes()
 
 
+class EvidenceCapture:
+    def __init__(self):
+        self.documents = set()
+
+    def answer(self, question, chunks, history=None):
+        self.documents = {chunk['filename'] for chunk in chunks}
+        citations = [{'document_id': chunk['document_id'], 'chunk_id': chunk['id'],
+                      'filename': chunk['filename'], 'page': chunk['page'], 'excerpt': chunk['text']}
+                     for chunk in chunks]
+        answer = '\n'.join(f"{chunk['filename']}: {chunk['text']}" for chunk in chunks)
+        return {'status': 'generated', 'answer': answer, 'citations': citations}
+
+
 @pytest.fixture
 def settings(tmp_path):
     return Settings(data_dir=tmp_path, requests_per_minute=120)
@@ -72,6 +85,96 @@ def test_sample_is_optional_deduplicated_inspectable_and_deletable(client):
     assert client.get(f"/api/documents/{doc['id']}/sources/{chunks[0]['id']}").status_code == 404
     assert client.get(f"/api/documents/{doc['id']}/preview").status_code == 404
     assert client.delete(f"/api/documents/{doc['id']}").status_code == 404
+
+
+def test_suggestions_are_document_scoped_and_workspace_private(client, settings):
+    raw = make_pdf('Solar panels have a measured output of 3 kW. The inverter converts electricity. '
+                   'Monthly generation is 120 kWh and maintenance is listed in a table.')
+    doc = client.post('/api/documents/upload', files={'file': ('solar.pdf', raw)}).json()
+    response = client.get('/api/suggestions', params=[('document_ids', doc['id'])])
+    assert response.status_code == 200
+    questions = [item['question'] for item in response.json()['suggestions']]
+    assert questions[0] == 'What is this document about?'
+    assert any('numbers' in question for question in questions)
+    assert any(any(term in question.casefold() for term in ('solar', 'inverter', 'electricity')) for question in questions)
+    assert client.get('/api/suggestions', params=[('document_ids', 'missing')]).status_code == 404
+    assert client.get('/api/suggestions').status_code == 400
+    with TestClient(create_app(settings), headers=HEADERS) as other:
+        assert other.get('/api/suggestions', params=[('document_ids', doc['id'])]).status_code == 404
+
+
+@pytest.fixture
+def selected_pdf_pair(client):
+    assignment = client.post('/api/documents/upload', files={'file': ('Assignment DM.pdf', make_pdf(
+        'Assignment DM explains five coursework topics and their announcement and submission dates.'))}).json()
+    solar = client.post('/api/documents/upload', files={'file': ('Solar Energy.pdf', make_pdf(
+        'Solar Energy explains photovoltaic panels, inverters, and household electricity generation.'))}).json()
+    capture = EvidenceCapture()
+    client.app.state.generator = capture
+    return assignment, solar, capture
+
+
+def _ask_selected(client, docs):
+    return client.post('/api/chat', json={
+        'query': 'Explain the selected documents separately.',
+        'document_ids': [doc['id'] for doc in docs],
+    })
+
+
+def test_chat_uses_both_selected_documents(selected_pdf_pair, client):
+    assignment, solar, capture = selected_pdf_pair
+    result = _ask_selected(client, [assignment, solar])
+    assert result.status_code == 200
+    assert capture.documents == {'Assignment DM.pdf', 'Solar Energy.pdf'}
+    assert 'Assignment DM.pdf' in result.json()['answer']
+    assert 'Solar Energy.pdf' in result.json()['answer']
+    assert {citation['filename'] for citation in result.json()['citations']} == capture.documents
+
+
+def test_chat_with_only_assignment_excludes_solar(selected_pdf_pair, client):
+    assignment, solar, capture = selected_pdf_pair
+    result = _ask_selected(client, [assignment])
+    assert result.status_code == 200
+    assert capture.documents == {'Assignment DM.pdf'}
+    assert 'Solar Energy.pdf' not in result.json()['answer']
+
+
+def test_chat_with_only_solar_excludes_assignment(selected_pdf_pair, client):
+    assignment, solar, capture = selected_pdf_pair
+    result = _ask_selected(client, [solar])
+    assert result.status_code == 200
+    assert capture.documents == {'Solar Energy.pdf'}
+    assert 'Assignment DM.pdf' not in result.json()['answer']
+
+
+def test_unchecked_pdf_is_excluded_from_chat_sources(selected_pdf_pair, client):
+    assignment, solar, capture = selected_pdf_pair
+    checked_ids = {assignment['id'], solar['id']}
+    unchecked_id = solar['id']
+    selected_ids = checked_ids - {unchecked_id}
+    result = _ask_selected(client, [doc for doc in (assignment, solar) if doc['id'] in selected_ids])
+    assert result.status_code == 200
+    assert capture.documents == {'Assignment DM.pdf'}
+    assert 'Solar Energy.pdf' not in result.json()['answer']
+
+
+def test_multi_document_overview_reaches_every_selected_document(client):
+    client.app.state.settings.upload_requests_per_minute = 10
+    client.app.state.settings.ip_upload_requests_per_minute = 10
+    documents = []
+    for index in range(6):
+        filename = f'Document {index + 1}.pdf'
+        raw = make_pdf(f'Distinctive evidence for document {index + 1}: topic{index + 1}.')
+        documents.append(client.post('/api/documents/upload', files={'file': (filename, raw)}).json())
+
+    capture = EvidenceCapture()
+    client.app.state.generator = capture
+    result = _ask_selected(client, documents)
+
+    assert result.status_code == 200
+    expected = {doc['filename'] for doc in documents}
+    assert capture.documents == expected
+    assert {citation['filename'] for citation in result.json()['citations']} == expected
 
 
 def test_upload_and_data_survive_restart(settings):
@@ -162,6 +265,24 @@ def test_real_generation_layer_integrates_with_retrieved_citations_and_followup(
             assert 'three-month emergency reserve' in json.dumps(requests[1])
             assert client.post('/api/conversations/clear', json={'conversation_id': answer['conversation_id']}).status_code == 200
             assert client.post('/api/chat', json={'query': 'More?', 'conversation_id': answer['conversation_id']}).status_code == 404
+
+
+def test_provider_rate_limit_message_and_retry_after_are_sanitized(settings):
+    def provider(_request):
+        return httpx.Response(429, text='private provider detail', headers={'Retry-After': '45'})
+
+    settings.generation_provider = 'openai'
+    settings.openai_api_key = 'offline-test-key'
+    with httpx.Client(transport=httpx.MockTransport(provider)) as transport:
+        app = create_app(settings, GenerationService(settings, transport))
+        with TestClient(app, headers=HEADERS) as client:
+            doc = client.post('/api/documents/upload', files={'file': ('notes.pdf', make_pdf('Measured output is 3 kW.'))}).json()
+            response = client.post('/api/chat', json={'query': 'What is the output?', 'document_ids': [doc['id']]})
+            assert response.status_code == 429
+            assert response.headers['retry-after'] == '45'
+            assert response.json() == {'detail': 'Answer generation is temporarily busy. Your documents are safe. Please try again shortly.'}
+            assert 'private provider detail' not in response.text
+            assert client.get('/api/documents').json()['documents'][0]['id'] == doc['id']
 
 
 def test_provider_error_does_not_create_conversation(client):

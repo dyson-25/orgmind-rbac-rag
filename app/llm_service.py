@@ -8,10 +8,13 @@ Instruction detection is a conservative heuristic, not a security boundary.
 import json
 import math
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import httpx
+from app.rag_engine import classify_query_intent
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -55,8 +58,10 @@ _SYSTEM_MESSAGE = (
     'No tools or other documents are available. Previous questions only resolve '
     'follow-up references; they are not evidence. Never assume a previous answer was true. '
     'Do not invent facts, quotes, sources, URLs, or page numbers. '
-    'Give a readable, conversational answer, combining relevant evidence across sources '
-    'when needed. For calculations use only supported quantities, preserve units and '
+    'Give a concise, conversational answer, combining relevant evidence across sources '
+    'when needed. Never print source IDs, document IDs, hashes, retrieval scores, JSON '
+    'fields, or citation metadata in answer text; source IDs belong only in citation_ids. '
+    'For calculations use only supported quantities, preserve units and '
     'periods, and explain the calculation. Distinguish conflicting evidence. '
     'Return only JSON with exactly two keys: answer (a nonempty string) and '
     'citation_ids (a list of the exact retrieved source id strings supporting the answer). '
@@ -64,16 +69,38 @@ _SYSTEM_MESSAGE = (
     'If the sources are insufficient, return the exact answer: '
     + INSUFFICIENT_EVIDENCE + ' with citation_ids set to [].'
 )
+_INTENT_GUIDANCE = {
+    'factual': 'Answer this focused question directly with only the evidence needed.',
+    'follow_up': 'Resolve the follow-up from the current question and prior user questions; retrieved passages remain the only evidence.',
+    'overview': 'Explain the document to a beginner using its main purpose, sections, and conclusion. Aim for about 120–160 words per document.',
+    'summary': 'Summarize the supplied evidence in about 120–200 words per document, preserving major sections and document identity.',
+    'key_points': 'Return exactly five concise numbered points when five are supported. Never pad with unsupported points.',
+    'multi_document_overview': 'Write a separate section headed by the exact filename for every source document. Cover every supplied document and never transfer facts between documents. Never state that only one document is selected when more than one source document is supplied.',
+    'comparison': 'Compare only facts supported by sources and attribute each fact to its document. Keep document evidence separate.',
+    'date_extraction': 'Extract dates and deadlines with their nearby labels. Clearly distinguish announcements from submissions or due dates; omit values not present.',
+    'date_number_extraction': 'Extract dates, deadlines, and important numbers with their nearby labels. Clearly distinguish announcements from submissions and keep every number attached to its row or assignment.',
+    'numeric_extraction': 'Extract numbers with the labels, units, and nearby context that explain them. Do not mix a value with a different row or date.',
+    'list_extraction': 'Return the requested items as a concise labeled list or table. Preserve each item’s nearby labels and relationships.',
+}
+_METADATA_LEAK = re.compile(
+    r'\b(?:citation_ids|retrieved_sources|chunk_id|document_id|source_id|retrieval_score)\b\s*["\']?\s*[:=]'
+    r'|["\']score["\']\s*:'
+    r'|\b(?:PDF_[0-9a-f]{16,}|[0-9a-f]{20,})\b'
+    r'|\b[0-9a-f]{8}-[0-9a-f-]{27,}\b'
+    r'|[\[(]\s*(?:PDF_)?[0-9a-f]{8,64}(?:\.{3}|…)?\s*[\]){}]'
+    r'|[\{]\s*["\']answer["\']\s*:', re.I,
+)
 
 
 class GenerationError(Exception):
     """An intentionally sanitized, API-safe generation failure."""
 
-    def __init__(self, message: str, status_code: int, category: str):
+    def __init__(self, message: str, status_code: int, category: str, retry_after: int | None = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.category = category
+        self.retry_after = retry_after
 
 
 def _previous_questions(question: str, history: list[dict] | None, budget: int) -> list[str]:
@@ -128,11 +155,23 @@ def _safe_sources(chunks: list[dict]) -> list[dict]:
     return sources
 
 
-def _http_failure(status: int) -> GenerationError:
+def _http_failure(status: int, headers=None) -> GenerationError:
     if status in (401, 403):
         return GenerationError('The answer provider rejected its credentials.', 502, 'authentication')
     if status == 429:
-        return GenerationError('The answer provider is at its usage limit. Please try later.', 429, 'quota')
+        raw = (headers or {}).get('Retry-After', '')
+        retry_after = None
+        try:
+            retry_after = max(1, min(3600, int(raw)))
+        except (TypeError, ValueError):
+            try:
+                date = parsedate_to_datetime(raw)
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                retry_after = max(1, min(3600, int((date - datetime.now(timezone.utc)).total_seconds())))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return GenerationError('Answer generation is temporarily busy. Your documents are safe. Please try again shortly.', 429, 'quota', retry_after)
     if status in (408, 504):
         return GenerationError('The answer provider timed out. Please try again.', 504, 'timeout')
     if status in (400, 404, 422):
@@ -171,6 +210,14 @@ def _parse_answer(response: httpx.Response, sources: list[dict]) -> dict:
                 or any(not isinstance(cid, str) or cid not in lookup for cid in ids)):
             raise ValueError
         text = text.strip()
+        if _METADATA_LEAK.search(text) or any(
+            len(source['id']) >= 16 and source['id'].casefold() in text.casefold()
+            for source in sources
+        ) or any(
+            len(source['document_id']) >= 20 and source['document_id'].casefold() in text.casefold()
+            for source in sources
+        ):
+            raise ValueError
         if text == INSUFFICIENT_EVIDENCE:
             if ids:
                 raise ValueError
@@ -228,37 +275,75 @@ class GenerationService:
                 raise ValueError
         except (ValueError, TypeError, AttributeError):
             raise GenerationError('The answer provider configuration is invalid.', 503, 'configuration') from None
-        payload = {
-            'model': settings.openai_model,
-            'max_tokens': max_tokens,
-            'response_format': {
-                'type': 'json_schema',
-                'json_schema': {'name': 'grounded_answer', 'strict': True, 'schema': _ANSWER_SCHEMA},
-            },
-            'provider': {'require_parameters': True},
-            'messages': [
-                {'role': 'system', 'content': _SYSTEM_MESSAGE},
-                {'role': 'user', 'content': json.dumps({
-                    'question': question.strip(),
-                    'previous_questions': _previous_questions(question, history, settings.max_query_chars),
-                    'retrieved_sources': sources,
-                }, ensure_ascii=False)},
-            ],
-        }
+        document_count = len({source['document_id'] for source in sources})
+        intent = classify_query_intent(question, document_count)
+        guidance = _INTENT_GUIDANCE[intent]
+
+        def make_payload(current_sources, concise=False):
+            instruction = guidance
+            if concise:
+                instruction += ' This is one concise recovery attempt: answer in at most 90 words total; include only the central supported facts.'
+            return {
+                'model': settings.openai_model,
+                'max_tokens': max_tokens,
+                'response_format': {
+                    'type': 'json_schema',
+                    'json_schema': {'name': 'grounded_answer', 'strict': True, 'schema': _ANSWER_SCHEMA},
+                },
+                'provider': {'require_parameters': True},
+                'messages': [
+                    {'role': 'system', 'content': _SYSTEM_MESSAGE + ' ' + instruction},
+                    {'role': 'user', 'content': json.dumps({
+                        'question': question.strip(), 'intent': intent,
+                        'previous_questions': _previous_questions(question, history, settings.max_query_chars),
+                        'retrieved_sources': current_sources,
+                    }, ensure_ascii=False)},
+                ],
+            }
+
+        def post_and_parse(current_sources, concise=False):
+            payload = make_payload(current_sources, concise)
+            try:
+                post = self._client.post if self._client is not None else httpx.post
+                response = post(
+                    base + '/chat/completions', json=payload,
+                    headers={'Authorization': 'Bearer ' + settings.openai_api_key.strip()},
+                    timeout=timeout, follow_redirects=False,
+                )
+            except httpx.TimeoutException:
+                raise GenerationError('The answer provider timed out. Please try again.', 504, 'timeout') from None
+            except (httpx.HTTPError, ValueError):
+                raise GenerationError('The answer provider is unavailable. Please try later.', 503, 'provider_unavailable') from None
+            try:
+                if not 200 <= response.status_code < 300:
+                    raise _http_failure(response.status_code, response.headers)
+                return _parse_answer(response, current_sources)
+            finally:
+                response.close()
+
         try:
-            post = self._client.post if self._client is not None else httpx.post
-            response = post(
-                base + '/chat/completions', json=payload,
-                headers={'Authorization': 'Bearer ' + settings.openai_api_key.strip()},
-                timeout=timeout, follow_redirects=False,
-            )
-        except httpx.TimeoutException:
-            raise GenerationError('The answer provider timed out. Please try again.', 504, 'timeout') from None
-        except (httpx.HTTPError, ValueError):
-            raise GenerationError('The answer provider is unavailable. Please try later.', 503, 'provider_unavailable') from None
+            return post_and_parse(sources)
+        except GenerationError as failure:
+            if failure.category != 'truncation':
+                raise
+        # At most one retry: retain one strong passage per document, or the top
+        # three within a single document. Output budget remains the configured cap.
+        retry_sources, seen_documents = [], set()
+        if document_count > 1:
+            for source in sources:
+                if source['document_id'] not in seen_documents:
+                    retry_sources.append(source)
+                    seen_documents.add(source['document_id'])
+                if len(retry_sources) == 5:
+                    break
+        else:
+            retry_sources = sources[:max(1, min(3, len(sources) - 1))]
         try:
-            if not 200 <= response.status_code < 300:
-                raise _http_failure(response.status_code)
-            return _parse_answer(response, sources)
-        finally:
-            response.close()
+            return post_and_parse(retry_sources or sources[:1], concise=True)
+        except GenerationError as failure:
+            if failure.category == 'truncation':
+                raise GenerationError(
+                    'The answer exceeded the provider response limit after one concise attempt. Please ask a narrower question.',
+                    502, 'truncation',
+                ) from None
+            raise
