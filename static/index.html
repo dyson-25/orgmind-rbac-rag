@@ -7,15 +7,16 @@
   <meta name="theme-color" content="#0c1c24">
   <meta name="description" content="A quiet studio for your PDFs. Explore documents, ask questions, and follow answers back to their sources.">
   <title>OrgMind · A studio for understanding</title>
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to documents and chat</a>
-  <div class="atmosphere" aria-hidden="true"><svg viewBox="0 0 1440 1000" fill="none" preserveAspectRatio="xMidYMid slice"><g class="current-lines"><path d="M-80 700C240 20 480 900 840 260S1330 70 1520 320"/><path d="M-80 720C240 40 480 920 840 280S1330 90 1520 340"/><path d="M-80 740C240 60 480 940 840 300S1330 110 1520 360"/><path d="M-80 760C240 80 480 960 840 320S1330 130 1520 380"/><path d="M-80 780C240 100 480 980 840 340S1330 150 1520 400"/></g><g class="orbit-points"><circle cx="235" cy="482" r="4"/><circle cx="974" cy="175" r="5"/><circle cx="1250" cy="234" r="3"/><path d="m1135 520 21-8 13 34-21 8zM178 245l25 9-14 38-25-9z"/></g></svg></div>
+  <canvas id="dot-field" class="dot-field" aria-hidden="true"></canvas>
   <header class="site-header">
     <a class="brand" href="/" aria-label="OrgMind home"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 40 40" fill="none"><path d="M6 30V10l14 7 14-7v20l-14 7-14-7Zm14-13v20M6 10l14-7 14 7" stroke="currentColor" stroke-width="1.5"/><path d="m12 14 14-7M12 20l8 4 8-4" stroke="currentColor" stroke-width="1.5"/></svg>OrgMind<span class="brand-dot">.</span></a>
-    <div class="header-right"><span class="product-label">THE DOCUMENT STUDIO</span><a class="header-link" href="#privacy-note">Your browser, your space <span aria-hidden="true">↗</span></a></div>
+    <div class="header-right"><span class="product-label">THE DOCUMENT STUDIO</span><a class="header-link" href="#privacy-note">Your browser, your space <span aria-hidden="true">↗</span></a><button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to night theme" title="Switch theme"><span aria-hidden="true">☾</span><span class="theme-label">Night</span></button></div>
   </header>
   <main id="main" tabindex="-1">
     <section class="intro" aria-labelledby="page-title">
@@ -49,7 +50,7 @@
       <section id="chat-panel" class="chat-panel" aria-labelledby="chat-title" hidden>
         <div class="panel-heading chat-heading"><div><h2 id="chat-title"><span class="spark" aria-hidden="true">✳</span> Document chat</h2><p id="chat-selection" class="small">Add a PDF to get started</p></div><button id="clear-conversation" class="button quiet" type="button" disabled>Clear chat</button></div>
         <div id="chat-scroll" class="chat-scroll">
-          <div id="chat-empty" class="chat-empty"><div class="empty-symbol" aria-hidden="true">✳</div><p class="section-kicker">THE CONVERSATION STARTS WITH CURIOSITY</p><h3>There’s more<br>between the lines.</h3><p>Ask for a summary, untangle an idea, or follow a detail. Every cited answer brings you back to the page.</p><div id="sample-suggestions" class="suggestions" hidden><p class="section-kicker">ASK ABOUT THE SAMPLE</p><button class="suggestion" type="button" data-query="How is the $3,000 monthly take-home pay split using the 50/30/20 budget?">How does the 50/30/20 budget work? <span aria-hidden="true">↗</span></button><button class="suggestion" type="button" data-query="What emergency fund target does the guide give for $1,500 in monthly essentials?">How much goes in an emergency fund? <span aria-hidden="true">↗</span></button><button class="suggestion" type="button" data-query="How much should I set aside each month for a $600 yearly expense?">How do I plan for a yearly expense? <span aria-hidden="true">↗</span></button></div></div>
+          <div id="chat-empty" class="chat-empty"><div class="empty-symbol" aria-hidden="true">✳</div><p class="section-kicker">THE CONVERSATION STARTS WITH CURIOSITY</p><h3>There’s more<br>between the lines.</h3><p>Ask for a summary, untangle an idea, or follow a detail. Every cited answer brings you back to the page.</p><section id="discovery-suggestions" class="suggestions" aria-labelledby="suggestion-title" hidden><p id="suggestion-title" class="section-kicker">START EXPLORING YOUR DOCUMENT</p><p class="suggestion-intro">Choose a question to discover what's inside.</p><div id="suggestion-list"></div></section></div>
           <div id="chat-messages" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions text"></div>
           <p id="chat-progress" class="chat-progress" role="status" hidden><span class="loading-dot" aria-hidden="true"></span> Reading your documents…</p>
         </div>
@@ -59,6 +60,6 @@
     <section id="privacy-note" class="privacy-note" aria-labelledby="privacy-title"><div><h2 id="privacy-title">A space in this browser.</h2><p id="session-notice">Your documents are private to this browser’s cookie. Cookie access does not prove identity. There are no accounts or account recovery; clearing cookies loses access. Keep your original files.</p></div><p class="provider-note">When generating answers, your file content and questions are sent to OpenRouter. Only upload documents you’re comfortable sharing with an AI provider.</p></section>
     <footer class="site-footer"><span>OrgMind <span aria-hidden="true">/</span> A studio for understanding.</span><span>YOUR PAGES. A NEW PERSPECTIVE.</span></footer>
   </main>
-  <dialog id="source-dialog" aria-labelledby="source-title"><div class="source-heading"><div><p class="section-kicker">SOURCE EVIDENCE</p><h2 id="source-title">Document source</h2></div><button id="close-source" class="button quiet" type="button" aria-label="Close source">Close <span aria-hidden="true">×</span></button></div><p id="source-status" class="small" role="status" aria-live="polite"></p><div class="source-layout"><section><h3>Extracted text</h3><p id="source-text" class="source-text"></p></section><section><h3>Original PDF page</h3><p id="preview-status" class="small" role="status"></p><img id="source-image" alt="" hidden></section></div></dialog>
+  <dialog id="source-dialog" aria-labelledby="source-title"><div class="source-heading"><div><p class="section-kicker">SOURCE EVIDENCE</p><h2 id="source-title">Document source</h2></div><button id="close-source" class="button quiet" type="button" aria-label="Close source">Close <span aria-hidden="true">×</span></button></div><p id="source-status" class="small" role="status" aria-live="polite"></p><div class="source-layout"><section><h3>Supporting passages</h3><div id="source-passages" class="source-passages"></div></section><section><h3>Original PDF page</h3><p id="preview-status" class="small" role="status"></p><img id="source-image" alt="" hidden></section></div></dialog>
 </body>
 </html>

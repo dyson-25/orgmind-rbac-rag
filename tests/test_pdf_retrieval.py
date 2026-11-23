@@ -1,8 +1,9 @@
 from pathlib import Path
+import re
 
 import pytest
 
-from app.rag_engine import RagEngine, query_terms
+from app.rag_engine import RagEngine, classify_query_intent, normalize_query, query_terms
 from tests.test_pdf_storage import pdf_bytes, settings_for, start
 
 
@@ -48,6 +49,42 @@ def test_query_terms_are_safe_deduplicated_and_not_enterprise_filtered():
     assert query_terms('révision année 2026') == ['révision', 'année', '2026']
 
 
+@pytest.mark.parametrize('question,intent', [
+    ('what this pdf has', 'overview'), ('whats inside this pdf', 'overview'),
+    ('tell me about this document', 'overview'), ('explain this pdf simple', 'overview'),
+    ('main things in this doc', 'overview'), ('what can i learn from this file', 'overview'),
+    ('dates and numbers in pdf', 'date_number_extraction'),
+    ('list all submision dates', 'date_extraction'),
+    ('what are the main differences between these two documents', 'comparison'),
+    ('Explain the selected documents separately.', 'overview'),
+])
+def test_imperfect_english_routes_deterministically(question, intent):
+    assert classify_query_intent(question) == intent
+
+
+def test_fuzzy_query_normalization_recovers_document_vocabulary(corpus):
+    _, _, rag, manual, _ = corpus
+    assert rag.retrieve('what is the use of turbin', [manual['id']])[0]['page'] == 1
+    assert classify_query_intent("what's inside this pdf") == 'overview'
+    assert classify_query_intent('Explain the selected documents separately.', 2) == 'multi_document_overview'
+    normalized = normalize_query('CCW332 Assignment 2026 ₹2,500 Inveter', {'assignment', 'inverter'})
+    assert 'CCW332' in normalized and '2026' in normalized and '₹' in normalized and '2,500' in normalized
+    assert normalized.endswith('inverter')
+
+
+def test_suggestions_are_local_document_scoped_and_content_conditional(corpus):
+    _, _, rag, manual, garden = corpus
+    manual_questions = [item['question'] for item in rag.suggest_questions([manual['id']])]
+    garden_questions = [item['question'] for item in rag.suggest_questions([garden['id']])]
+    assert manual_questions and manual_questions[0] == 'What is this document about?'
+    assert any('numbers' in question for question in manual_questions)
+    assert not any('dates' in question for question in manual_questions)
+    assert any('orchid' in question.casefold() or 'garden' in question.casefold() for question in garden_questions)
+    both = rag.suggest_questions([manual['id'], garden['id']])
+    assert both[0]['question'] == 'Explain the selected documents separately.'
+    assert {doc_id for item in both for doc_id in item['document_ids']} == {manual['id'], garden['id']}
+
+
 def test_chunk_overlap_and_blank_page_numbers(tmp_path):
     settings = settings_for(tmp_path, chunk_size=120, chunk_overlap=30)
     db, rag = start(settings)
@@ -63,6 +100,28 @@ def test_chunk_overlap_and_blank_page_numbers(tmp_path):
     assert row['pages'] == 3
     assert rag.retrieve('zirconium')[0]['page'] == 3
     assert db.get_document(row['id'])['pages'] == 3
+
+
+def test_boundary_aware_chunks_keep_paragraphs_sentences_unicode_and_numbers(tmp_path):
+    settings = settings_for(tmp_path, chunk_size=150, chunk_overlap=24)
+    _, rag = start(settings)
+    paragraphs = [
+        'Solar panels produce electricity from sunlight. An inverter converts the direct current into usable alternating current.',
+        'The household pays $1,250.50 per month for electricity. A long paragraph continues with useful technical detail about the system and its measured seasonal output. ' * 2,
+        'Résumé notes: café equipment uses 230 V.编号 ４ includes Unicode and full-width numerals.',
+    ]
+    text = '\n\n'.join(paragraphs)
+    chunks = list(rag._chunks('solar', [text]))
+    assert chunks and all(row[1] == 'solar' and row[2] == 1 and row[3].strip() for row in chunks)
+    assert all(len(row[3]) <= settings.chunk_size + 40 for row in chunks)
+    assert all(not re.search(r'\b[a-zA-Z]{1,2}$', row[3]) for row in chunks[:-1])
+    assert any('Solar panels produce electricity from sunlight.' in row[3] for row in chunks)
+    assert any('$1,250.50' in row[3] for row in chunks)
+    assert any('café' in row[3] for row in chunks)
+    for left, right in zip(chunks, chunks[1:]):
+        overlap = max((size for size in range(1, min(len(left[3]), len(right[3])) + 1)
+                       if left[3][-size:] == right[3][:size]), default=0)
+        assert overlap >= 12
 
 
 def test_top_five_deduplicates_identical_text(tmp_path):
@@ -164,6 +223,171 @@ def test_summary_spans_sample_pages_without_overlapping_chunks(finance):
         assert {hit['page'] for hit in hits} == {1, 2, 3, 4}
         assert len(hits) == 4
     assert rag.retrieve('Summary', [], owner_id=owner) == []
+
+
+def test_natural_document_discovery_queries_use_representative_evidence(finance):
+    db, rag, owner, doc = finance
+    queries = (
+        'What is this PDF about?', 'What does this document contain?', 'Explain this file.',
+        'What are the important topics?', 'What can I learn from this PDF?',
+    )
+    for query in queries:
+        hits = rag.retrieve(query, [doc['id']], owner_id=owner)
+        assert hits, query
+        assert all(hit['document_id'] == doc['id'] and hit['page'] > 0 for hit in hits)
+    assert rag.retrieve('What government subsidy is available for solar installations?',
+                        [doc['id']], owner_id=owner) == []
+
+
+def test_one_page_overview_can_use_multiple_distinct_passages(tmp_path):
+    settings = settings_for(tmp_path, chunk_size=280, chunk_overlap=45)
+    db, rag = start(settings)
+    owner = db.resolve_session(db.create_session(86400), 86400)
+    sections = (
+        'Photovoltaic cells convert incoming sunlight into direct-current electrical energy for homes.',
+        'An inverter changes direct current into alternating current used by household appliances.',
+        'Battery storage keeps extra daytime electricity available after sunset or during outages.',
+        'Roof orientation and nearby shade affect the amount of electricity a solar array can produce.',
+        'A monitoring display tracks daily generation and helps identify unexpected system changes.',
+        'Utility bill credits depend on the local agreement for sending unused electricity to the grid.',
+        'Installers inspect roof structure, wiring, grounding, and disconnect switches for safe operation.',
+        'Periodic visual checks and prompt repair help maintain reliable equipment over the years.',
+    )
+    text = '\n\n'.join(sections)
+    doc = rag.ingest(pdf_bytes(text), 'overview.pdf', owner_id=owner)
+    hits = rag.retrieve('What is this PDF about?', [doc['id']], owner_id=owner)
+    assert len(hits) >= 2
+    assert len({hit['text'] for hit in hits}) == len(hits)
+    assert {hit['page'] for hit in hits} == {1}
+
+
+def test_deterministic_query_intent_variants():
+    cases = {
+        'What is this PDF about?': 'overview',
+        'Explain this document to me.': 'overview',
+        'What can I learn from this file?': 'overview',
+        'What are the main points?': 'key_points',
+        'What are the five most important points?': 'key_points',
+        'Find the important dates.': 'date_extraction',
+        'Extract all values and deadlines.': 'date_number_extraction',
+        'What important information is mentioned?': 'overview',
+        'List all marks and amounts.': 'numeric_extraction',
+        'List names, dates and numbers.': 'date_number_extraction',
+        'Compare the two documents.': 'comparison',
+        'What does each document contain?': 'multi_document_overview',
+        'Explain this document to a beginner.': 'multi_document_overview',
+        'What does it say about those?': 'follow_up',
+        'What does the inverter do?': 'factual',
+    }
+    for question, expected in cases.items():
+        count = 2 if question in {'What does each document contain?',
+                                 'Explain this document to a beginner.'} else 1
+        assert classify_query_intent(question, count) == expected, question
+
+
+def test_assignment_style_date_number_and_topic_extraction_stays_labeled(tmp_path):
+    settings = settings_for(tmp_path)
+    db, rag = start(settings)
+    owner = db.resolve_session(db.create_session(86400), 86400)
+    text = '''Course code: CCW332
+Assignment 1 — Distributed systems
+Announcement date: 01/02/2025 | Last submission date: 15/02/2025 | Marks: 10
+Assignment 2 — Database design
+Announcement date: 03/02/2025 | Last submission date: 17/02/2025 | Marks: 15
+Assignment 3 — Cloud security
+Announcement date: 05/02/2025 | Last submission date: 19/02/2025 | Marks: 20
+Assignment 4 — Data analytics
+Announcement date: 07/02/2025 | Last submission date: 21/02/2025 | Marks: 25
+Assignment 5 — Mobile computing
+Announcement date: 09/02/2025 | Last submission date: 23/02/2025 | Marks: 30'''
+    doc = rag.ingest(pdf_bytes(text), 'Assignment DM.pdf', owner_id=owner)
+    queries = (
+        'What are the five assignment topics?',
+        'What important dates and numbers are mentioned?',
+        'List all announcement dates.', 'List all submission deadlines.',
+        'How many marks does each assignment carry?',
+        'What are the dates associated with Assignment 3?',
+        'What information can I find in this PDF?',
+    )
+    for question in queries:
+        hits = rag.retrieve(question, [doc['id']], owner_id=owner)
+        assert hits, question
+        assert all(hit['document_id'] == doc['id'] and hit['page'] == 1 for hit in hits)
+        evidence = '\n'.join(hit['text'] for hit in hits)
+        for required in ('CCW332', 'Assignment 1', 'Assignment 3', '01/02/2025',
+                         '15/02/2025', 'Marks: 20'):
+            assert required in evidence, (question, required)
+    normalized = re.sub(r'\s+', ' ', evidence)
+    expected_rows = (
+        ('Assignment 1', '01/02/2025', '15/02/2025', '10'),
+        ('Assignment 2', '03/02/2025', '17/02/2025', '15'),
+        ('Assignment 3', '05/02/2025', '19/02/2025', '20'),
+        ('Assignment 4', '07/02/2025', '21/02/2025', '25'),
+        ('Assignment 5', '09/02/2025', '23/02/2025', '30'),
+    )
+    for name, announced, deadline, marks in expected_rows:
+        row_pattern = rf'{name}.*?Announcement date: {announced}.*?Last submission date: {deadline}.*?Marks: {marks}'
+        assert re.search(row_pattern, normalized), name
+    assert rag.retrieve('What government grant is available for this course?',
+                        [doc['id']], owner_id=owner) == []
+
+
+def test_five_page_key_points_cover_opening_and_conclusion(tmp_path):
+    _, rag = start(settings_for(tmp_path))
+    pages = (
+        'Introduction: A household solar photovoltaic system converts sunlight into electricity.',
+        'Panels produce direct current, and an inverter changes it into alternating current.',
+        'A 3 kW design uses six 500 W panels connected according to the system plan.',
+        'At 5 peak-sun-hours, daily generation is about 15 kWh, or 450 kWh in 30 days.',
+        'Conclusion: final yield and payback depend on shade, weather, tariff, and maintenance.',
+    )
+    doc = rag.ingest(pdf_bytes(*pages), 'Home Solar PV Guide.pdf')
+    hits = rag.retrieve('What are the five most important points?', [doc['id']])
+    assert {hit['page'] for hit in hits} == {1, 2, 3, 4, 5}
+    assert any('Introduction:' in hit['text'] for hit in hits)
+    assert any('Conclusion:' in hit['text'] for hit in hits)
+
+
+def test_generated_solar_guide_questions_retrieve_labeled_values(tmp_path):
+    _, rag = start(settings_for(tmp_path))
+    pages = (
+        'Home Solar PV Guide. A photovoltaic array supplies a home with electricity from sunlight.',
+        'The inverter converts the panels direct current into alternating current used by appliances.',
+        'Six 500 W panels make a 3 kW system. At 5 peak sun hours it generates about 15 kWh daily and 450 kWh in 30 days.',
+        'The total initial budget is Rs 60,000. Monthly bill savings are Rs 2,000, so the simple payback period is 30 months.',
+        'Panel output varies with shade, weather, orientation, inverter efficiency, and maintenance.',
+    )
+    doc = rag.ingest(pdf_bytes(*pages), 'Home Solar PV Guide.pdf')
+    questions = {
+        'What is this PDF about?': 'photovoltaic',
+        'Explain this document to a beginner.': 'photovoltaic',
+        'What does the inverter do?': 'alternating current',
+        'How many 500 W panels are required for a 3 kW system?': 'six 500 W panels',
+        'How much electricity does it generate in 30 days?': '450 kWh in 30 days',
+        'What is the total initial budget?': 'Rs 60,000',
+        'What is the simple payback period?': '30 months',
+        'What if monthly savings increase to ₹2,500?': 'Rs 2,000',
+        'What are the five most important points?': 'maintenance',
+    }
+    for question, evidence in questions.items():
+        hits = rag.retrieve(question, [doc['id']])
+        assert hits, question
+        assert evidence.casefold() in '\n'.join(hit['text'] for hit in hits).casefold(), question
+    assert rag.retrieve('What government subsidy is available?', [doc['id']]) == []
+
+
+def test_selected_multi_document_overview_is_scoped_and_distributed(tmp_path):
+    settings = settings_for(tmp_path)
+    db, rag = start(settings)
+    owner = db.resolve_session(db.create_session(86400), 86400)
+    first = rag.ingest(pdf_bytes('Assignment DM covers five course tasks and their submission dates.'),
+                       'Assignment DM.pdf', owner_id=owner)
+    second = rag.ingest(pdf_bytes('Home Solar PV explains panels, inverters, and household energy yield.'),
+                        'Home Solar PV Guide.pdf', owner_id=owner)
+    both = rag.retrieve('Explain each document to a beginner.', [first['id'], second['id']], owner_id=owner)
+    assert {hit['document_id'] for hit in both} == {first['id'], second['id']}
+    only_first = rag.retrieve('Explain this document to a beginner.', [first['id']], owner_id=owner)
+    assert only_first and {hit['document_id'] for hit in only_first} == {first['id']}
 
 
 def test_summary_round_robin_and_spread_across_selected_documents(tmp_path):

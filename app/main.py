@@ -167,6 +167,20 @@ def create_app(settings=None, generator=None):
         with db.lock:
             return {'documents': [document(doc) for doc in db.list_documents(owner_id=token)]}
 
+    @app.get('/api/suggestions')
+    def suggestions(document_ids: list[str] = Query(default=[]), token=Depends(access)):
+        selected = list(dict.fromkeys(document_ids))
+        if not selected or len(selected) > 50:
+            raise HTTPException(400, 'Select between 1 and 50 indexed documents.')
+        with db.lock:
+            try:
+                for doc_id in selected:
+                    if db.get_document(doc_id, owner_id=token)['status'] != 'indexed':
+                        raise HTTPException(400, 'Selected document is not indexed.')
+            except KeyError:
+                raise HTTPException(404, 'Selected document no longer exists.') from None
+            return {'suggestions': rag.suggest_questions(selected, owner_id=token)}
+
     def ingest(raw, filename, owner_id):
         try:
             with db.lock:
@@ -261,7 +275,8 @@ def create_app(settings=None, generator=None):
             try:
                 result = app.state.generator.answer(query, chunks, history=history)
             except GenerationError as exc:
-                raise HTTPException(exc.status_code, str(exc)) from None
+                headers = {'Retry-After': str(exc.retry_after)} if exc.retry_after else None
+                raise HTTPException(exc.status_code, str(exc), headers=headers) from None
             with sessions.lock:
                 messages = history + [{'role': 'user', 'content': query}, {'role': 'assistant', 'content': result['answer'][:8000]}]
                 conversations[cid] = {'documents': selected, 'messages': messages[-12:]}
